@@ -1,0 +1,71 @@
+{
+    "test_suite" : "Stream_Test",
+    "test_name" : "LDMSD Stream Service",
+    "test_type" : "SVT",
+    "define" : [
+	{
+	    "name" : "stream-subscriber",
+	    "type" : "sampler",
+	    "listen_port" : 10000,
+	    "listen_xprt" : "sock",
+	    "listen_auth" : "munge",
+	    "env" : [
+		"INTERVAL=1000000",
+		"OFFSET=0"
+	    ],
+	    "samplers" : [
+		{
+		    "plugin" : "test_stream_sampler",
+		    "config" : [
+			"stream=test_stream",
+			"expect=/data/Stream_Test-data.json"
+		    ],
+		    "start" : true
+		}
+	    ]
+	}
+    ],
+    "daemons" : [
+	{
+	    "host" : "stream-sampler-1",
+	    "asset" : "stream-subscriber",
+	    "env" : [
+		"COMPONENT_ID=10001",
+		"HOSTNAME=%host%"
+	    ]
+	},
+	{
+	    "host" : "stream-sampler-2",
+	    "asset" : "stream-subscriber",
+	    "env" : [
+		"COMPONENT_ID=10002",
+		"HOSTNAME=%host%"
+	    ]
+	},
+	{
+	    "host" : "agg-1",
+	    "listen_port" : 20000,
+	    "listen_xprt" : "sock",
+	    "listen_auth" : "munge",
+	    "env" : [
+		"HOSTNAME=%host%"
+	    ],
+	    "samplers" : [
+		{
+		    "plugin" : "test_stream_sampler",
+		    "config" : [
+			"stream=test_stream",
+			"expect=/data/Stream_Test-data.json"
+		    ],
+		    "start" : true
+		}
+	    ],
+	    "config" : [
+		"prdcr_add name=s1 type=active xprt=sock host=stream-sampler-1 port=10000 auth=munge interval=20000000",
+		"prdcr_add name=s2 type=active xprt=sock host=stream-sampler-2 port=10000 auth=munge interval=20000000",
+		"prdcr_subscribe regex=.* stream=test_stream",
+		"prdcr_start_regex regex=.*"
+	    ]
+	}
+    ]
+}

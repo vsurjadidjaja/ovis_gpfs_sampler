@@ -1,0 +1,21 @@
+[Unit]
+Description = LDMS Sampler Daemon
+Documentation = http://ovis.ca.sandia.gov
+
+[Service]
+Type = forking
+EnvironmentFile = @sysconfdir@/ldms/ldmsd.sampler.env
+Environment = HOSTNAME=%H
+ExecStartPre = /bin/mkdir -p @localstatedir@/run/ldmsd
+ExecStartPre = -/bin/bash -c "test -n \"${LDMS_JOBINFO_DATA_FILE}\" && touch ${LDMS_JOBINFO_DATA_FILE} || touch /var/run/ldms_jobinfo.data"
+ExecStart = @sbindir@/ldmsd \
+		-x ${LDMSD_XPRT}:${LDMSD_PORT} \
+		-c ${LDMSD_PLUGIN_CONFIG_FILE} \
+		-a ${LDMSD_AUTH_PLUGIN} \
+		-v ${LDMSD_VERBOSE} \
+		-m ${LDMSD_MEM} \
+		$LDMSD_LOG_OPTION \
+		-r @localstatedir@/run/ldmsd/sampler.pid
+
+[Install]
+WantedBy = default.target

@@ -1,0 +1,2881 @@
+#!/usr/bin/env python3
+
+#######################################################################
+# -*- c-basic-offset: 8 -*-
+# Copyright (c) 2015-2019 National Technology & Engineering Solutions
+# of Sandia, LLC (NTESS). Under the terms of Contract DE-NA0003525 with
+# NTESS, the U.S. Government retains certain rights in this software.
+# Copyright (c) 2015-2019 Open Grid Computing, Inc. All rights reserved.
+#
+# This software is available to you under a choice of one of two
+# licenses.  You may choose to be licensed under the terms of the GNU
+# General Public License (GPL) Version 2, available from the file
+# COPYING in the main directory of this source tree, or the BSD-type
+# license below:
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+#      Redistributions of source code must retain the above copyright
+#      notice, this list of conditions and the following disclaimer.
+#
+#      Redistributions in binary form must reproduce the above
+#      copyright notice, this list of conditions and the following
+#      disclaimer in the documentation and/or other materials provided
+#      with the distribution.
+#
+#      Neither the name of Sandia nor the names of any contributors may
+#      be used to endorse or promote products derived from this software
+#      without specific prior written permission.
+#
+#      Neither the name of Open Grid Computing nor the names of any
+#      contributors may be used to endorse or promote products derived
+#      from this software without specific prior written permission.
+#
+#      Modified source versions must be plainly marked as such, and
+#      must not be misrepresented as being the original software.
+#
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#######################################################################
+
+from __future__ import print_function
+from builtins import str
+import struct
+import cmd
+import argparse
+import sys
+import os
+import traceback
+import json
+import re
+from datetime import datetime
+
+from ldmsd import ldmsd_util
+from ldmsd.ldmsd_communicator import LDMSD_Request, LDMSD_Req_Attr
+from ldmsd.ldmsd_communicator import Communicator, fmt_status
+import errno
+import math
+
+LDMSD_REQ_SOM_F=1
+LDMSD_REQ_EOM_F=2
+LDMSD_REQ_ALL_F=(LDMSD_REQ_SOM_F|LDMSD_REQ_EOM_F)
+LDMSD_CLI_REQ=1
+LDMSD_PRDCR_STATUS_REQ=0x104
+LDMSD_PRDCR_SET_REQ=0x107
+LDMSD_STRGP_STATUS_REQ=0x204
+LDMSD_UPDTR_STATUS_REQ=0x304
+LDMSD_PLUGN_STATUS_REQ=0x504
+
+def cvt_intrvl_off_to_str(interval_us, offset_us):
+    interval_s = float(interval_us) / 1000000.0
+    offset_ms = float(offset_us) / 1000.0
+    return str(interval_s) + "s:" + str(offset_ms) + "ms"
+
+class LdmsdCmdParser(cmd.Cmd):
+    def __init__(self, host = None, port = None, xprt = None, infile=None,
+                 auth=None, auth_opt=None, debug=False):
+        self.msg_no = 1
+
+        if host and port:
+            if debug:
+                self.comm = Communicator(xprt,
+                                         host,
+                                         port,
+                                         auth,
+                                         auth_opt,
+                                         recv_timeout=None)
+            else:
+                self.comm = Communicator(xprt,
+                                         host,
+                                         port,
+                                         auth,
+                                         auth_opt)
+            rc = self.comm.connect()
+            if rc:
+                raise ConnectionError("Please verify the transport, hostname, port, and authentication method.")
+            self.prompt = "{0}:{1}:{2}> ".format(xprt, host, port)
+        else:
+            self.comm = None
+            self.prompt = "(not connected)> "
+
+        if infile:
+            cmd.Cmd.__init__(self, stdin=infile)
+        else:
+            cmd.Cmd.__init__(self)
+
+    def __complete_attr_list(self, verb, text):
+        req_opt_attr = self.comm.get_cmd_attr_list(verb)
+        attr_list = []
+        if req_opt_attr['req'] is not None:
+            attr_list = req_opt_attr['req']
+        if req_opt_attr['opt'] is not None:
+            attr_list += req_opt_attr['opt']
+        return ["{0}=".format(attr) for attr in attr_list if attr.startswith(text)]
+
+    def emptyline(self):
+        pass
+
+    def __check_command_syntax(self, attr_value):
+        tokens = attr_value.split(" ")
+        for tk in tokens:
+            if tk.endswith("="):
+                return False
+        return True
+
+    def __check_command_args(self, verb, args):
+        req_opt_attr = self.comm.get_cmd_attr_list(verb)
+        if set(req_opt_attr['req']) <= set(args):
+            return 0
+        else:
+            print(f'Error: The attributes {req_opt_attr["req"]} are required by {verb}')
+            return 1
+
+    def do_shell(self, args):
+        """
+        Execute a shell command
+        """
+        os.system(args)
+
+    def do_comment(self, args):
+        """
+        skip comments
+        """
+        pass
+
+    def do_say(self, args):
+        """
+        Print a message to the console
+        """
+        print(args)
+
+    def do_connect(self, args):
+        if self.state != self.comm.CONNECTED:
+            if self.comm:
+                self.comm.connect()
+            kwargs = {
+                "xprt": "sock",
+                "host": "localhost",
+                "port": None,
+                "auth": "none",
+                "auth_opt": {},
+            }
+            r = re.compile(r"\s*(\w+)=(\w+)")
+            for attr, value in r.findall(args):
+                if attr in kwargs:
+                    kwargs[attr] = value
+                else:
+                    # treat as auth options
+                    kwargs["auth_opt"][attr] = value
+            self.comm = Communicator(kwargs['xprt'],
+                                     kwargs['host'],
+                                     kwargs['port'],
+                                     kwargs['auth'],
+                                     kwargs['auth_opt'])
+            rc = self.comm.connect()
+            if rc:
+                self.promt = "Error connecting to {1} on port {2} with {0}".format(xprt, host, port)
+            else:
+                self.prompt = "{0}:{1}:{2}> ".format(xprt, host, port)
+        else:
+            print(f"WARN: Already connected, do nothing.")
+            return None
+
+    def complete_connect(self, text, line, begidx, endidx):
+        name_list = ["xprt=", "host=", "port=", "auth="]
+        full_list = ["xprt=(sock|rdma|ugni)",
+                     "host=HOSTNAME",
+                     "port=PORT",
+                     "auth=AUTH_METHOD"]
+        if not text:
+            return full_list
+        return [x for x in name_list if x.startswith(text)]
+
+    def precmd(self, line):
+        if line[0:1] == '#':
+            return ''
+        return line
+
+    def handle_args(self, verb, _args):
+        if _args and not self.__check_command_syntax(_args):
+            print("Syntax error, there are attributes for which no value is given.")
+        req_opt_attr = self.comm.get_cmd_attr_list(verb)
+
+        if not self.comm:
+            print("Error: no LDMS connection")
+            return None
+
+        kwargs = {}
+        if _args is not None:
+            attr_s = []
+            cfg_str = ''
+            attr_str_list = _args.split()
+            for attr_str in attr_str_list:
+                name = None
+                value = None
+                try:
+                    name, value = attr_str.split("=")
+                    if (verb == "config") or (verb == "env") or (verb == 'auth_add'):
+                        kwargs['cfg_str'] = None
+                        if name not in req_opt_attr['req'] and name not in req_opt_attr['opt']:
+                            if len(cfg_str) > 0:
+                                cfg_str += ' '
+                            cfg_str += attr_str
+                            continue
+
+                    kwargs[name] = value
+                except ValueError:
+                    # keyword
+                    kwargs[attr_str] = True
+
+        if len(cfg_str) > 0:
+            kwargs['cfg_str'] = cfg_str
+
+        if not all(key in kwargs.keys() for key in req_opt_attr['req']):
+            print(f'Error: The attribute(s) {set(req_opt_attr["req"]) - kwargs.keys()} are required by {verb}')
+            return None
+
+        for opt in req_opt_attr['opt']:
+            if opt not in kwargs:
+                kwargs[opt] = None
+
+        return kwargs
+
+    def read_none_tty(self, fin):
+        for cmd in fin:
+            self.onecmd(cmd)
+
+    def do_dump_cfg(self, arg):
+        """
+        Dump the current running configuration to a file specified in the path
+
+        Parameters:
+        path - path to valid directory to write LDMSD configuration file.
+               Filename is generated using the hostname and port of the ldmsd
+               that received the configuration request. e.g. <hostname>-<port>.conf
+        """
+        arg = self.handle_args('dump_cfg', arg)
+        if arg:
+            rc, msg = self.comm.dump_cfg(arg['path'])
+            if rc:
+                print(f'Error {rc} printing current configuration: {msg}')
+
+    def do_source(self, arg):
+        """
+        Parse commands from the specified file as if they were entered
+        on the console.
+
+        Parameters:
+        path - path to file
+        """
+        arg = self.handle_args('source', arg)
+        if arg:
+            script = open(arg['path'], 'r')
+            self.read_none_tty(script)
+            for cmd in script:
+                self.onecmd(cmd)
+            script.close()
+
+    def do_script(self, arg):
+        """
+        Execute the given executable file and submit the resulting configuration to LDMSD
+        Example:
+            script /path/to/executable
+
+        Parameters:
+        path  - the executable file path
+        """
+        arg = self.handle_args('script', arg)
+        if arg:
+            exit_code, out, err = ldmsd_util.sh_exec(arg['path'])
+            if exit_code != 0:
+                print("Script exited with code {0} and error: {1}".format(exit_code, err))
+                return
+            cfg = out.split("\n")
+            for cmd in cfg:
+                self.onecmd(cmd)
+
+    def do_try(self, arg):
+        print(self.__complete_attr_list(arg, ""))
+
+    def do_usage(self, arg):
+        """List the usage of the plugins loaded on the server.
+        """
+        arg = self.handle_args('usage', arg)
+        if arg:
+            rc, msg = self.comm.usage(arg['name'])
+            if rc == 0:
+                print(msg)
+
+    def complete_usage(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('usage', text)
+
+    def do_load(self, arg):
+        """
+        Load a plugin at the Aggregator/Producer
+        Parameters:
+        name=     The plugin name
+        """
+        arg = self.handle_args('load', arg)
+        if arg:
+            rc, msg = self.comm.plugn_load(arg['name'])
+            if rc:
+                print(f'Error loading plugin {arg["name"]}: {msg}')
+
+    def complete_load(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('load', text)
+
+    def do_daemon_exit(self, arg):
+        """
+        Exit the connected LDMS daemon
+        """
+        rc, msg = self.comm.daemon_exit()
+        if rc == 0:
+            self.do_quit(arg)
+            print("Please 'quit' the ldmsd_controller interface")
+
+    def complete_daemon_exit(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('daemon_exit', text)
+
+    def do_prdcr_add(self, arg):
+        """
+        Add an LDMS Producer to the Aggregator
+        Parameters:
+        name=     A unique name for this Producer
+        xprt=     The transport name [sock, rdma, ugni]
+        host=     The hostname of the host
+        type=     The connection type [active, passive, bridge]
+                  Active -- A connection is initiated with the peer and
+                           its metric sets will be queried.
+                  Passive - A connect request is expected from the specified producer.
+                            After the connection is established, the peer's metric sets
+                            will be queried
+                  Bridge -- A connection is initiated to the remote peer,
+                            but its metric sets are not queried.
+                            This is the active side of the passive-mode producer.
+        [port=]   The port number on which the peer LDMS is listening. It is not required, if type is PASSIVE.
+        reconnect= The connection retry interval (us)
+        interval= The connection retry interval (us) (Deprecated, please use 'reconnect'.)
+        [auth=]   The authentication method
+        [perm=]   The permission to modify the producer in the future.
+        [rail=]   The number of rail endpoints for the prdcr (default: 1).
+        [credits=] The send credits our ldmsd (the one we are controlling)
+                   advertises to the prdcr (default: value from ldmsd --credits
+                   option). This limits how much outstanding data our ldmsd
+                   holds for the prdcr. The prdcr drops messages when it does
+                   not have enough send credits.
+        [rx_rate=] The recv rate (bytes/sec) limit for this connection. The
+                   default is -1 (unlimited).
+        """
+        arg = self.handle_args('prdcr_add', arg)
+        if arg is None:
+            return
+        if arg['interval'] is None and arg['reconnect'] is None:
+            print(f"The attribute 'reconnect' is missing.")
+        else:
+            if arg['interval'] is not None:
+                if arg['reconnect'] is not None:
+                    print(f"Both 'interval' and 'reconnect' is given. The 'reconnect' value will be used.")
+                else:
+                    arg['reconnect'] = arg['interval']
+                    print(f"'interval' is being deprecated. Please, use 'reconnect' in the future.")
+            rc, msg = self.comm.prdcr_add(arg['name'],
+                                          arg['type'],
+                                          arg['xprt'],
+                                          arg['host'],
+                                          arg['port'],
+                                          arg['reconnect'],
+                                          arg['auth'],
+                                          arg['perm'],
+                                          arg['rail'],
+                                          arg['credits'],
+                                          arg['rx_rate'])
+            if rc:
+                print(f'Error adding prdcr {arg["name"]}: {msg}')
+
+    def complete_prdcr_add(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_add', text)
+
+    def do_bridge_add(self, arg):
+        """
+        Add a bridge connection. This is the active side of the passive producer.
+        Parameters:
+                name=     A unique name for this Producer
+                xprt=     The transport name [sock, rdma, ugni]
+                host=     The hostname of the host
+                reconnect= The connection retry interval (us)
+                [auth=]   The authentication method
+                [perm=]   The permission to modify the producer in the future.
+                [rail=]   The number of rail endpoints for the prdcr (default: 1).
+                [credits=] The send credits our ldmsd (the one we are controlling)
+                           advertises to the prdcr (default: value from ldmsd --credits
+                           option). This limits how much outstanding data our ldmsd
+                           holds for the prdcr. The prdcr drops messages when it does
+                           not have enough send credits.
+                [rx_rate=] The recv rate (bytes/sec) limit for this connection. The
+                           default is -1 (unlimited).
+        """
+        arg = self.handle_args('prdcr_add', arg)
+        if arg is None:
+            return
+        if arg['reconnect'] is None:
+            print(f"The attribute 'reconnect' is missing.")
+        else:
+            rc, msg = self.comm.prdcr_add(arg['name'],
+                                          "bridge",
+                                          arg['xprt'],
+                                          arg['host'],
+                                          arg['port'],
+                                          arg['reconnect'],
+                                          arg['auth'],
+                                          arg['perm'],
+                                          arg['rail'],
+                                          arg['credits'],
+                                          arg['rx_rate'])
+            if rc:
+                print(f'Error adding Bridge {arg["name"]}: {msg}')
+
+    def complete_bridge_add(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('bridge_add', text)
+
+    def do_prdcr_del(self, arg):
+        """
+        Delete an LDMS Producer from the Aggregator. The producer
+        cannot be in use or running.
+        Parameters:
+        name=    The Producer name
+        """
+        arg = self.handle_args('prdcr_del', arg)
+        if arg:
+            rc, msg = self.comm.prdcr_del(arg['name'])
+            if rc:
+                print(f'Error deleting prdcr {arg["name"]}: {msg}')
+
+    def complete_prdcr_del(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_del', text)
+
+    def do_bridge_del(self, arg):
+        """
+        Delete a bridge from the sampler daemon. The bridge connot be in use.
+        Parameters:
+        name =   The bridge name
+        """
+        self.do_prdcr_del(arg)
+
+    def complete_bridge_del(self, text, line, begidx, endidx):
+        return self.complete_prdcr_del(text, line, begidx, endidx)
+
+    def do_prdcr_start(self, arg):
+        """
+        Start the specified producer.
+        Parameters:
+        name=     The name of the producer
+        [reconnect=] The connection retry interval in micro-seconds. If this is not
+                  specified, the previously configured value will be used.
+        [interval=]  The same as reconnect. It is being deprecated. Please use 'reconnect'.
+        """
+        arg = self.handle_args('prdcr_start', arg)
+        if arg:
+            if arg['reconnect'] is None and arg['interval'] is not None:
+                arg['reconnect'] = arg['interval']
+                print(f"'interval' is being deprecated. Please, use 'reconnect' in the future")
+            rc, msg = self.comm.prdcr_start(arg['name'], regex=False, reconnect=arg['reconnect'])
+            if rc:
+                print(f'Error starting prdcr {arg["name"]}: {msg}')
+
+    def complete_prdcr_start(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_start', text)
+
+    def do_bridge_start(self, arg):
+        self.do_prdcr_start(arg)
+
+    def complete_bridge_del(self, text, line, begidx, endidx):
+        return self.complete_prdcr_start(text, line, begidx, endidx)
+
+    def do_prdcr_start_regex(self, arg):
+        """
+        Start all producers matching a regular expression.
+        Parameters:
+        regex=     A regular expression
+        [reconnect=]  The connection retry interval in micro-seconds. If this is not
+                   specified, the previously configured value will be used.
+        [interval=]   The same as reconnect. It is being deprecated. Please use 'reconnect'.
+        """
+        arg = self.handle_args('prdcr_start_regex', arg)
+        if arg:
+            if arg['reconnect'] is None and arg['interval'] is not None:
+                arg['reconnect'] = arg['interval']
+                print(f"'interval' is being deprecated. Please, use 'reconnect' in the future.")
+            rc, msg = self.comm.prdcr_start(arg['regex'], reconnect=arg['reconnect'])
+            if rc:
+                print(f'Error starting prdcr(s) with regex {arg["regex"]}: {msg}')
+
+    def complete_prdcr_start_regex(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_start_regex', text)
+
+    def do_prdcr_stop(self, arg):
+        """
+        Stop the specified Producer.
+        Parameters:
+        name=  The producer name
+        """
+        arg = self.handle_args('prdcr_stop', arg)
+        if arg:
+            rc, msg = self.comm.prdcr_stop(arg['name'], regex=False)
+            if rc:
+                print(f'Error stopping prdcr {arg["name"]}: {msg}')
+
+    def complete_prdcr_stop(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_stop', text)
+
+    def do_bridge_stop(self, arg):
+        """
+        Stop the specified Bridge
+        Parameters:
+        name=  The bridge name
+        """
+        self.do_prdcr_stop(arg)
+
+    def complete_bridge_stop(self, text, line, begidx, endidx):
+        return self.complete_prdcr_stop(text, line, begidx, endidx)
+
+    def do_prdcr_stop_regex(self, arg):
+        """
+        Stop all producers matching a regular expression.
+        Parameters:
+        regex=   The regular expression
+        """
+        arg = self.handle_args('prdcr_stop_regex', arg)
+        if arg:
+            rc, msg = self.comm.prdcr_stop(arg['regex'])
+            if rc:
+               print(f'Error stopping prdcr(s) with regex {arg["regex"]}: {msg}')
+
+    def complete_prdcr_stop_regex(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_stop_regex', text)
+
+    def do_prdcr_subscribe(self, arg):
+        """
+        Subscribe for stream data from all matching producers
+        Parameters:
+        regex=     A regular expression matching PRODUCER names
+        stream=    The stream name or regular expression
+        [rx_rate=] The recv rate (bytes/sec) limit for the matching streams. The
+                   default is -1 (unlimited).
+        """
+        arg = self.handle_args('prdcr_subscribe', arg)
+        if arg:
+            rc, msg = self.comm.prdcr_subscribe(arg['regex'], arg['stream'],
+                                                arg['rx_rate'])
+            if rc:
+                print(f'Error subscribing to stream {arg["stream"]}: {msg}')
+
+    def complete_prdcr_subscribe(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_subscribe', text)
+
+    def do_prdcr_unsubscribe(self, arg):
+        """
+        Subscribe for stream data from all matching producers
+        Parameters:
+        regex=     A regular expression matching producer names
+        stream=    The stream name
+        """
+        arg = self.handle_args('prdcr_unsubscribe', arg)
+        if arg:
+            rc, msg = self.comm.prdcr_unsubscribe(arg['regex'], arg['stream'])
+            if rc:
+                print(f'Error unsubscribing from stream {arg["stream"]}: {msg}')
+
+    def complete_prdcr_unsubscribe(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_unsubscribe', text)
+
+    def do_prdcr_stream_status(self, arg):
+        """
+        Get stream_status of the matched prdcr. The connected LDMSD acts as a proxy.
+        Parameters:
+        regex=     A regular expression matching producer names
+        """
+        print("prdcr_stream_status is deprecated")
+        return
+        # DEPRECATED
+        FIRST = "first_ts"
+        LAST = "last_ts"
+        RATE = "bytes/sec"
+        FREQ = "msg/sec"
+
+        def dur(info):
+            return (info[LAST] - info[FIRST])/60.0
+
+        def rate(info):
+            if not info or RATE not in info.keys():
+                return "-"
+            return info[RATE]
+
+        def freq(info):
+            if not info or FREQ not in info.keys():
+                return "-"
+            return info[FREQ]
+
+        def total_bytes(info):
+            if not info or "total_bytes" not in info.keys():
+                return "-"
+            return info['total_bytes']
+
+        def count(info):
+            if not info or "count" not in info.keys():
+                return "-"
+            return info['count']
+
+        arg = self.handle_args('prdcr_stream_status', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.prdcr_stream_status(arg['regex'])
+        if msg is None:
+            raise RuntimeError("no response")
+        if (rc == 0):
+            streams = fmt_status(msg)
+            print("Name         Producer                    bytes/sec    msg/sec      total bytes  msg count   ")
+            print("-" * 12, "-" * 27, "-" * 12, "-" * 12, "-" * 12, "-" * 12)
+            for sname,s in streams.items():
+                if sname == "_OVERALL_":
+                    continue
+                print(f"{sname:12}")
+                for name,p in s.items():
+                    print(f"{' ' * 12} {name} ({p['mode']})")
+                    print(f"{' '*12} {'   published':20} {rate(p['pub']):>12} {freq(p['pub']):>12} {total_bytes(p['pub']):>12} {count(p['pub']):>12}")
+                    print(f"{' '*12} {'   received':20} {rate(p['recv']):>12} {freq(p['recv']):>12} {total_bytes(p['recv']):>12} {count(p['recv']):>12}")
+
+    def complete_prdcr_stream_status(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_stream_status', text)
+
+    def do_updtr_add(self, arg):
+        """
+        Add an Updater that will periodically update Producer metric sets either
+        by pulling the content or by registering for an update push. The default
+        is to pull set contents.
+        Parameters:
+        name=       The update policy name
+        [interval=] The update/collect interval. This is required only when the
+                    push argument is not given.
+        [offset=]   Offset for synchronized aggregation
+        [push=]     [onchange|true] 'onchange' means the
+                    Updater will get an update whenever the set source ends a
+                    transaction or pushes the update. 'true' means the Updater
+                    will receive an update only when the set source explicitly
+                    pushes the update.
+                    If `push` is used, `auto_interval` cannot be `true`.
+        [auto_interval=]   [true|false] If true, the updater will schedule
+                           set updates according to the update hint. The sets
+                           with no hints will not be updated. If false, the
+                           updater will schedule the set updates according to
+                           the given interval and offset values. If not
+                           specified, the value is `false`.
+        [perm=]     The permission to modify the updater in the future.
+        """
+        arg = self.handle_args('updtr_add', arg)
+        if arg:
+            rc, msg = self.comm.updtr_add(arg['name'],
+                                          arg['interval'],
+                                          arg['offset'],
+                                          arg['push'],
+                                          arg['auto_interval'],
+                                          arg['perm'])
+            if rc:
+                print(f'Error adding updtr {arg["name"]}: {msg}')
+
+    def complete_updtr_add(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('updtr_add', text)
+
+    def do_updtr_del(self, arg):
+        """
+        Remove an updater from the configuration
+        Parameter:
+        name=     The update policy name
+        """
+        arg = self.handle_args('updtr_del', arg)
+        if arg:
+            rc, msg = self.comm.updtr_del(arg['name'])
+            if rc:
+                print(f'Error removing updater: {msg}')
+
+    def complete_updtr_del(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('updtr_del', text)
+
+    def do_updtr_match_add(self, arg):
+        """
+        Add a match condition that specifies the sets to update.
+        Parameters::
+        name=   The update policy name
+        regex=  The regular expression string
+        match=  The value with which to compare; if match=inst,
+                the expression will match the set's instance name, if
+                match=schema, the expression will match the set's
+                schema name.
+        """
+        arg = self.handle_args('updtr_match_add', arg)
+        if arg:
+            rc, msg = self.comm.updtr_match_add(arg['name'], arg['regex'], arg['match'])
+            if rc:
+                print(f'Error adding match condition {arg["match"]} to {arg["name"]}: {msg}')
+
+    def complete_updtr_match_add(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('updtr_match_add', text)
+
+    def do_updtr_match_del(self, arg):
+        """
+        Remove a match condition from the Updater. The
+        parameters are as follows:
+        name=   The update policy name
+        regex=  The regular expression string
+        match=  The value with which to compare; if match=inst,
+                the expression will match the set's instance name, if
+                match=schema, the expression will match the set's
+                schema name.
+        """
+        arg = self.handle_args('updtr_match_del', arg)
+        if arg:
+            rc, msg = self.comm.updtr_match_del(arg['name'])
+            if rc:
+                print(f'Error deleting match condition from the updater: {msg}')
+
+    def complete_updtr_match_del(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('updtr_match_del', text)
+
+    def do_updtr_match_list(self, arg):
+        """
+        Return the regex match list of updaters
+        Parameters are as follows:
+        name=  The update policy name. If none, return the list of regular expressions to match set names or set schemas.
+        """
+        arg = self.handle_args('updtr_match_list', arg)
+        rc, msg = self.comm.updtr_match_list(arg['name'])
+        if rc == 0:
+            updaters = fmt_status(msg)
+            print("{0:21} {1:16} {2:15}".format("Updater Name", "Regex", "Selector"))
+            print(f"{'-'*21} {'-'*16} {'-'*15}")
+            for updtr in updaters:
+                print(f"{updtr['name']:21}")
+                for m_ in updtr['match']:
+                    print(f"{'':21} {m_['regex']:16} {m_['selector']:15}")
+        else:
+            print(f'Error retrieving matched sets: {msg}')
+
+    def complete_updtr_match_list(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('updtr_match_list', text)
+
+    def do_updtr_prdcr_add(self, arg):
+        """
+        Add matching Producers to an Updater policy. The parameters are as
+        follows:
+        name=   The update policy name
+        regex=  A regular expression matching zero or more producers
+        """
+        arg = self.handle_args('updtr_prdcr_add', arg)
+        if arg:
+            rc, msg = self.comm.updtr_prdcr_add(arg['name'], arg['regex'])
+            if rc:
+                print(f'Error adding prdcr {arg["name"]}: {msg}')
+
+    def complete_updtr_prdcr_add(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('updtr_prdcr_add', text)
+
+    def do_updtr_prdcr_del(self, arg):
+        """
+        Remove matching Producers from an Updater policy. The parameters are as
+        follows:
+        name=    The update policy name
+        regex=   A regular expression matching zero or more producers
+        """
+        arg = self.handle_args('updtr_prdcr_del', arg)
+        if arg:
+            rc, msg = self.comm.updtr_prdcr_del(arg['name'], arg['regex'])
+            if rc:
+                print(f'Error deleting prdcr {arg["name"]}: {msg}')
+
+    def complete_updtr_prdcr_del(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('updtr_prdcr_del', text)
+
+    def do_updtr_start(self, arg):
+        """
+        Start updaters. The parameters to the commands are as
+        follows:
+        name=     The update policy name
+        [interval=] The update interval in micro-seconds. If this is not
+                  specified, the previously configured value will be used.
+        [offset=]   Offset for synchronization
+                    If 'interval' is given but not 'offset,
+                    the updater will update sets asynchronously.
+        [auto_interval=]   [true|false] If true, the updater will schedule
+                           set updates according to the update hint. If false,
+                           the updater will schedule the set updates according
+                           to the default schedule, i.e., the given interval and offset values.
+        """
+        arg = self.handle_args('updtr_start', arg)
+        if arg:
+            rc, msg = self.comm.updtr_start(arg['name'], arg['interval'], arg['offset'], arg['auto_interval'])
+            if rc:
+                print(f'Error starting updtr {arg["name"]}: {msg}')
+
+    def complete_updtr_start(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('updtr_start', text)
+
+    def do_updtr_stop(self, arg):
+        """
+        Stop the Updater. The Updater must be stopped in order to
+        change it's configuration.
+        Paramaeters:
+        name=   The update policy name
+        """
+        arg = self.handle_args('updtr_stop', arg)
+        if arg:
+            rc, msg = self.comm.updtr_stop(arg['name'])
+            if rc:
+                print(f'Error stopping updater {arg["name"]}: {msg}')
+
+    def complete_updtr_stop(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('updtr_stop', text)
+
+    def do_strgp_add(self, arg):
+        """
+        Create a Storage Policy and open/create the storage instance.
+        Parameters:
+        name=      The unique storage policy name.
+        plugin=    The name of the storage backend.
+        container= The storage backend container name.
+        [schema=]  The schema name of the metric set to store. If 'schema' is given, 'regex' is ignored.
+        [regex=]   A regular expression matching set schemas. It must be used with decomposition.
+        [flush=]   The interval between calls to the storage plugin flush method.
+                   By default, the flush method is not called.
+        [perm=]    The permission to modify the storage policy in the future.
+        [decomposition=]   Path to a decomposition configuration file
+        """
+        arg = self.handle_args('strgp_add', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.strgp_add(arg['name'],
+                                      arg['plugin'],
+                                      arg['container'],
+                                      arg['schema'],
+                                      arg['regex'],
+                                      arg['perm'],
+                                      arg['flush'],
+                                      arg['decomposition'])
+        if rc:
+            print(f'Error adding storage policy {arg["name"]}: {msg}')
+
+    def complete_strgp_add(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('strgp_add', text)
+
+    def do_strgp_del(self, arg):
+        """
+        Remove a Storage Policy. All updaters must be stopped in order for
+        a storage policy to be deleted.
+        Parameters:
+        name=   The storage policy name
+        """
+        arg = self.handle_args('strgp_del', arg)
+        if arg:
+            rc, msg = self.comm.strgp_del(arg['name'])
+            if rc:
+                print(f'Error deleting storage policy {arg["name"]}: {msg}')
+
+    def complete_strgp_del(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('strgp_del', text)
+
+    def do_strgp_prdcr_add(self, arg):
+        """
+        Add a regular expression used to identify the producers this
+        storage policy will apply to.
+        Parameters:
+        name=   The storage policy name
+        regex=  A regular expression matching metric set producers
+        """
+        arg = self.handle_args('strgp_prdcr_add', arg)
+        if arg:
+            rc, msg = self.comm.strgp_prdcr_add(arg['name'], arg['regex'])
+            if rc:
+                print(f'Error adding producer(s) {arg["regex"]} to storage policy {arg["name"]}: {msg}')
+
+    def complete_strgp_prdcr_add(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('strgp_prdcr_add', text)
+
+    def do_strgp_prdcr_del(self, arg):
+        """
+        Remove a regular expression from the producer match list.
+        Parameters:
+        name=   The storage policy name
+        regex=  The regular expression to remove
+        """
+        arg = self.handle_args('strgp_prdcr_del', arg)
+        if arg:
+            rc, msg = self.comm.strgp_prdcr_del(arg['name'], arg['regex'])
+            if rc:
+                print(f'Error removing producer(s) {arg["regex"]} from storage policy {arg["name"]} match list: {msg}')
+
+    def complete_strgp_prdcr_del(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('strgp_prdcr_del', text)
+
+    def do_strgp_metric_add(self, arg):
+        """
+        Add the name of a metric to store. If the metric list is NULL,
+        all metrics in the metric set will be stored.
+        Parameters:
+        name=   The storage policy name
+        metric= The metric name
+        """
+        arg = self.handle_args('strgp_metric_add', arg)
+        if arg:
+            rc, msg = self.comm.strgp_metric_add(arg['name'], arg['metric'])
+            if rc:
+                print(f'Error adding metric {arg["metric"]} to storage policy {arg["name"]}: {msg}')
+
+    def complete_strgp_metric_add(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('strgp_metric_add', text)
+
+    def do_strgp_metric_del(self, arg):
+        """
+        Remove a metric from the set of stored metrics.
+        Parameters:
+        name=   The storage policy name
+        metric= The metric to remove
+        """
+        arg = self.handle_args('strgp_metric_del', arg)
+        if arg:
+            rc, msg = self.comm.strgp_metric_del(arg['name'], arg['metric'])
+            if rc:
+                print(f'Error deleting metric {arg["metric"]} to storage policy {arg["name"]}: {msg}')
+
+    def complete_strgp_set_del(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('strgp_metric_del', text)
+
+    def do_strgp_start(self, arg):
+        """
+        Start storage policy.
+        name=    The storage policy name
+        """
+        arg = self.handle_args('strgp_start', arg)
+        if arg:
+            rc, msg = self.comm.strgp_start(arg['name'])
+            if rc:
+                print(f'Error starting storage policy {arg["name"]}: {msg}')
+
+    def complete_strgp_start(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('strgp_start', text)
+
+    def do_strgp_stop(self, arg):
+        """
+        Stop storage policies. A storage policy must be stopped in order to
+        change its configuration.
+        Paramaeters:
+        name=    The storage policy name
+        """
+        arg = self.handle_args('strgp_stop', arg)
+        if arg:
+            rc, msg = self.comm.strgp_stop(arg['name'])
+            if rc:
+                print(f'Error stopping storage policy {arg["name"]}: {msg}')
+
+    def complete_strgp_stop(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('strgp_stop', text)
+
+    def do_daemon_status(self, arg):
+        """
+        Report the daemon status
+        Keyword Parameter:
+        thread_stats - Keyword to return daemon thread status along with
+                       current daemon status
+        """
+        arg = self.handle_args('daemon_status', arg)
+        rc, msg = self.comm.daemon_status(arg['thread_stats'])
+        if rc == 0:
+            msg = fmt_status(msg)
+            print(f"Deamon State: {msg['state']}\n")
+            if arg['thread_stats']:
+                self.display_thread_stats(msg['thread_stats'])
+        else:
+            print(f'Error getting daemon status')
+
+    def complete_daemon_status(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('daemon_status', text)
+
+    def do_prdcr_status(self, arg):
+        """
+        Get the statuses of all producers
+        Parameters:
+        [name=]        producer name
+        """
+        arg = self.handle_args('prdcr_status', arg)
+        if arg:
+            rc, msg = self.comm.prdcr_status(arg['name'])
+            if rc == 0 and msg is not None:
+                producers = fmt_status(msg)
+                print("Name             Host             Port         Transport    State        Type")
+                print("---------------- ---------------- ------------ ------------ ------------ ----------")
+                for prdcr in producers:
+                    if prdcr['type'] == 'bridge':
+                        continue
+                    print(f"{prdcr['name']:16} {prdcr['host']:16} {prdcr['port']:12} {prdcr['transport']:12} " \
+                          f"{prdcr['state']:12} {prdcr['type']:10}")
+                    for pset in prdcr['sets']:
+                        print("    {0:16} {1:16} {2}".format(pset['inst_name'],
+                                                             pset['schema_name'],
+                                                             pset['state']))
+            else:
+                print(f'Error getting prdcr status: {msg}')
+
+    def complete_prdcr_status(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_status', text)
+
+    def do_bridge_status(self, arg):
+        """
+        Get the statuses of bridge connections
+        Parameters:
+        [name=]        Bridge name
+        """
+        arg = self.handle_args('prdcr_status', arg)
+        if arg:
+            rc, msg = self.comm.prdcr_status(arg['name'])
+            if rc == 0 and msg is not None:
+                producers = fmt_status(msg)
+                print("Name             Host             Port         Transport    State")
+                print("---------------- ---------------- ------------ ------------ ------------")
+                for prdcr in producers:
+                    if prdcr['type'] != 'bridge':
+                        continue
+                    print(f"{prdcr['name']:16} {prdcr['host']:16} {prdcr['port']:12} {prdcr['transport']:12} " \
+                          f"{prdcr['state']:12}")
+            else:
+                print(f'Error getting prdcr status: {msg}')
+
+    def complete_bridge_status(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_status', text)
+
+    def do_prdcr_set_status(self, arg):
+        """
+        Report the statuses of producer sets that are matched the given conditions.
+        Parameters:
+        [producer=]        Producer name
+        [instance=]        Instance name
+        [schema=]          Schema name
+        """
+        arg = self.handle_args('prdcr_set_status', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.prdcr_set_status(arg['producer'], arg['instance'], arg['schema'])
+        if rc == 0:
+            metric_sets = fmt_status(msg)
+
+            print("Name                 Schema Name      State      Origin           Producer         timestamp                duration (sec)")
+            print("-------------------- ---------------- ---------- ---------------- ---------------- ------------------------- ---------------")
+            for pset in metric_sets:
+                ts = float(pset['timestamp.sec'])
+                ts_sec = datetime.fromtimestamp(ts).strftime('%m-%d-%y %H:%M:%S')
+                ts_str = "{0} [{1}]".format(ts_sec, pset['timestamp.usec'])
+                dur = pset['duration.sec'] + "." + pset['duration.usec'].zfill(6)
+                print("{0:20} {1:16} {2:10} {3:16} {4:16} {5:25} {6:12}".format(pset['inst_name'],
+                                                                                pset['schema_name'],
+                                                                                pset['state'],
+                                                                                pset['origin'],
+                                                                                pset['producer'],
+                                                                                ts_str,
+                                                                                dur))
+        else:
+            print(f'Error reporting the status of prdcr sets: {msg}')
+
+    def complete_prdcr_set_status(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_set_status', text)
+
+    def do_updtr_status(self, arg):
+        """
+        Get the statuses of all Updaters.
+
+        Parameters:
+        [name=]        updater name
+        [summary]      not show updaters' producers
+        [reset=]       'false' for not resetting the counter after it reports the information.
+                       If it isn't given, the counters are not reset.
+
+        Counter descriptions:
+          Skipped      The number of times there exists an outstanding update request when the updater tries to schedule an update request.
+          Oversampled  The number of times the generation number of a set has not changed from the previous update complete.
+        """
+        arg = self.handle_args('updtr_status', arg)
+        rc, msg = self.comm.updtr_status(**arg)
+        if rc == 0:
+            updaters = fmt_status(msg)
+            print("Name             Interval:Offset  Auto   Mode            State        Skipped counter Oversampled counter")
+            print(f"---------------- ---------------- ------ --------------- ------------ {'-'*15} {'-'*19}")
+            for updtr in updaters:
+                if 'auto' in updtr:
+                    auto = updtr['auto']
+                else:
+                    # for backward compatabiliity
+                    auto = updtr['????']
+                interval_s = cvt_intrvl_off_to_str(updtr['interval'], updtr['offset'])
+                print(f"{updtr['name']:16} {interval_s:16} {auto:6} {updtr['mode']:15} " \
+                      f"{updtr['state']:10} {updtr['outstanding count']:15} " \
+                      f"{updtr['oversampled count']:19}")
+                if arg['summary'] is None:
+                    for prdcr in updtr['producers']:
+                        print("    {0:16} {1:16} {2:12} {3:12} {4:12}".format(
+                            prdcr['name'], prdcr['host'], prdcr['port'],
+                            prdcr['transport'], prdcr['state']))
+
+    def complete_updtr_status(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('updtr_status', text)
+
+    def __update_time_stats(self, updtr):
+        stats = {'min' : float("inf"),
+                 'max' : 0,
+                 'avg' : 0,
+                 'sum' : 0,
+                 'cnt' : 0,
+                 'min_prdcr' : None,
+                 'max_prdcr' : None,
+                 'producers' : {}
+               }
+
+        for p, prdcr in updtr.items():
+            pstats = { 'min' : float("inf"),
+                       'max' : 0,
+                       'sum' : 0,
+                       'avg' : 0,
+                       'cnt' : 0,
+                       'min_prdset' : None,
+                       'max_prdset' : None,
+                       'sets' : {}
+                    }
+            for s, prdset in prdcr.items():
+                pstats['sets'][s] = {'min' : prdset['min'],
+                                     'max' : prdset['max'],
+                                     'avg' : prdset['avg'],
+                                     'cnt' : prdset['cnt']
+                                    }
+                if pstats['min'] > prdset['min']:
+                    pstats['min'] = prdset['min']
+                    pstats['min_prdset'] = s
+                if pstats['max'] < prdset['max']:
+                    pstats['max'] = prdset['max']
+                    pstats['max_prdset'] = s
+
+                if prdset['cnt'] > 0:
+                    pstats['avg'] = pstats['avg'] * (pstats['cnt']/(pstats['cnt'] + prdset['cnt']))
+                    pstats['avg'] += prdset['avg'] * (prdset['cnt']/(pstats['cnt'] + prdset['cnt']))
+                    pstats['cnt'] += prdset['cnt']
+            stats['producers'][p] = pstats
+
+            if stats['min'] > pstats['min']:
+                stats['min'] = pstats['min']
+                stats['min_prdcr'] = p
+            if stats['max'] < pstats['max']:
+                stats['max'] = pstats['max']
+                stats['max_prdcr'] = p
+            if pstats['cnt'] > 0:
+                stats['avg'] = stats['avg'] * (stats['cnt']/(stats['cnt'] + pstats['cnt']))
+                stats['avg'] += pstats['avg'] * (pstats['cnt']/(stats['cnt'] + pstats['cnt']))
+                stats['cnt'] += pstats['cnt']
+        return stats
+
+    def do_update_time_stats(self, arg):
+        """
+        Get the update time statistics of updaters
+
+        - Updater is the updater name.
+        - Min(usec) is the minimum time the updater spent to update a set.
+        - Max(usec) is the maximum time the updater spent to update a set.
+        - Average(usec) is the average time the updater spent to update a set.
+        - Count is the number of samples used to calculate the minimum, maximum, and average values.
+
+        Parameters:
+        [name=]        updater name
+        [reset=]       If 'true', reset the statistics after returning the values.
+                       The default is false.
+        """
+        arg = self.handle_args('update_time_stats', arg)
+        rc, msg = self.comm.update_time_stats(**arg)
+        if rc != 0:
+            print(f'Error {rc}: {msg}')
+            return
+
+        j = fmt_status(msg)
+        print("Updater         Min(usec)       Max(usec)       Average(usec)   Count     ")
+        print(f"{'-'*15} {'-'*15} {'-'*15} {'-'*15} {'-'*10}")
+        if rc !=0:
+            return
+        for n, updtr in j.items():
+            stats = self.__update_time_stats(updtr)
+            print(f"{n:15} {stats['min']:15.4f} {stats['max']:15.4f} {stats['avg']:15.4f} {stats['cnt']:10}")
+
+    def complete_update_time_stats(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('update_time_stats', text)
+
+    def do_strgp_status(self, arg):
+        """
+        Get the status of storage policies
+        Parameters:
+            [name=]    a storage policy name
+        """
+        arg = self.handle_args('strgp_status', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.strgp_status(arg['name'])
+        if rc == 0:
+            policies = fmt_status(msg)
+            print(f"{'Name':16} {'Container':16} {'Schema':16} {'Regex':16} {'Plugin':16} {'Flush':16} {'State':10} {'Decomposition':20}")
+            print(f"{'-'*16} {'-'*16} {'-'*16} {'-'*16} {'-'*16} {'-'*16} {'-'*10} {'-'*20}")
+            for strgp in policies:
+                print(f"{strgp['name']:16} {strgp['container']:16} "
+                      f"{strgp['schema']:16} {strgp['regex']:16} "
+                      f"{strgp['plugin']:16} {strgp['flush']:16} {strgp['state']:10} "
+                      f"{strgp['decomp']}")
+                print("    producers: ", end='')
+                for prdcr in strgp['producers']:
+                    print("{0} ".format(prdcr), end='')
+                print('')
+                print("    metrics: ", end='')
+                for metric in strgp['metrics']:
+                    print("{0} ".format(metric), end='')
+                print('')
+
+    def complete_strgp_status(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('strgp_status', text)
+
+    def __datatbl_new(self):
+        return {'set_name' : [],
+                'min' : math.inf,
+                'max' : 0,
+                'avg' : 0,
+                'count' : 0,
+                'start_ts' : None,
+                'end_ts' : None,
+                'min_member' : None,
+                'max_member' : None,
+                'min_avg_member' : None,
+                'max_avg_member' : None}
+
+    def __bounds(self, tbl):
+        min_v = math.inf
+        max_v = 0
+        min_avg = math.inf
+        max_avg = 0
+
+        for k in tbl.keys():
+            if k == 'stats':
+                continue
+            if min_v > tbl[k]['stats']['min']:
+                min_v = tbl[k]['stats']['min']
+                tbl['stats']['min_member'] = k
+            if max_v < tbl[k]['stats']['max']:
+                max_v = tbl[k]['stats']['max']
+                tbl['stats']['max_member'] = k
+            if min_avg > tbl[k]['stats']['avg']:
+                min_avg = tbl[k]['stats']['avg']
+                tbl['stats']['min_avg_member'] = k
+            if max_avg < tbl[k]['stats']['avg']:
+                max_avg = tbl[k]['stats']['avg']
+                tbl['stats']['max_avg_member'] = k
+
+    def __avg_update(self, cur_avg, cur_cnt, v, cnt):
+        new_cnt = cur_cnt + cnt
+        return (cur_avg * (cur_cnt / new_cnt) + v * (cnt / new_cnt), new_cnt)
+
+    def __min_max(self, tbl, data):
+        is_min = False
+        is_max = False
+        if tbl['min'] > data['min']:
+            tbl['min'] = data['min']
+            tbl['min_ts'] = data['min_ts']
+            is_min = True
+        if tbl['max'] < data['max']:
+            tbl['max'] = data['max']
+            tbl['max_ts'] = data['max_ts']
+            is_max = True
+        return (is_min, is_max)
+
+    def __datatbl_update(self, pset, strgp_tbl, schema_tbl, thread_tbl):
+        stgtbl = strgp_tbl['stats']
+        sstgtbl = strgp_tbl[pset['schema']]['stats']
+        tsstgtbl = strgp_tbl[pset['schema']][pset['thread_id']]['stats']
+
+        stbl = schema_tbl[pset['schema']]['stats']
+        ttbl = thread_tbl[pset['thread_id']]['stats']
+        tstbl = thread_tbl[pset['thread_id']][pset['schema']]['stats']
+
+        pset_avg = pset['stats']['avg']
+        pset_count = pset['stats']['count']
+
+        stgtbl['set_name'].append(pset['name'])
+        sstgtbl['set_name'].append(pset['name'])
+        tsstgtbl['set_name'].append(pset['name'])
+        stbl['set_name'].append(pset['name'])
+        ttbl['set_name'].append(pset['name'])
+        tstbl['set_name'].append(pset['name'])
+
+        stgtbl['avg'], stgtbl['count'] = self.__avg_update(stgtbl['avg'], stgtbl['count'],
+                                                           pset_avg, pset_count)
+        sstgtbl['avg'], sstgtbl['count'] = self.__avg_update(sstgtbl['avg'], sstgtbl['count'],
+                                                           pset_avg, pset_count)
+        tsstgtbl['avg'], tsstgtbl['count'] = self.__avg_update(tsstgtbl['avg'], tsstgtbl['count'],
+                                                           pset_avg, pset_count)
+
+        stbl['avg'], stbl['count'] = self.__avg_update(stbl['avg'], stbl['count'],
+                                                       pset_avg, pset_count)
+
+        ttbl['avg'], ttbl['count'] = self.__avg_update(ttbl['avg'], ttbl['count'],
+                                                       pset_avg, pset_count)
+        tstbl['avg'], tstbl['count'] = self.__avg_update(tstbl['avg'], tstbl['count'],
+                                                         pset_avg, pset_count)
+
+        self.__min_max(stgtbl, pset['stats'])
+        self.__min_max(sstgtbl, pset['stats'])
+        self.__min_max(tsstgtbl, pset['stats'])
+        self.__min_max(stbl, pset['stats'])
+        self.__min_max(ttbl, pset['stats'])
+        self.__min_max(tstbl, pset['stats'])
+
+    def __store_time_process(self, d):
+        # -----------------------------------------------
+        # SOURCE DICT
+        # -----------------------------------------------
+        # Assume that d = { <strgp_name> :{ 'sets': { <set_name> : { <data> }
+        #                                            }
+        #                                 }
+        #                 },
+        # where, <data> = { 'min' : <float>,
+        #                   'max' : <float>,
+        #                   'avg' : <float>,
+        #                   'cnt' : <int>,
+        #                   'start_ts' : <float>, # in seconds
+        #                   'end_ts' : <float> # in seconds
+        #                 }
+        #
+        # -----------------------------------------------
+        # RESULT TABLES
+        # -----------------------------------------------
+        # stats = { 'min' : <float>,
+        #           'max' : <float>,
+        #           'avg' : <float>,
+        #           'cnt' : <int>,
+        #           'start' : <float> in seconds,
+        #           'end' : <float> in seconds,
+        #           'set_name' : [<set name, the order is the name as the lists above>]
+        #         }
+        #
+        # schema_tbl = { 'stats': <stats>,
+        #                <schema_name> : {'stats' : <stats>},
+        #                ...
+        #              }
+        schema_tbl = {'stats' : self.__datatbl_new()}
+        # thread_tbl = { 'stats' : <stats>,
+        #                <thread_id> : { 'stats' : <stats>,
+        #                                <schema_name> : {'stats' : <stats> },
+        #                                ...
+        #                              }
+        #               }
+        thread_tbl = {'stats' : self.__datatbl_new()}
+        #strgp_tbl = { 'stats' : <stats>,
+        #              <strgp name> : { 'stats' : <stats>,
+        #                               <schema_name> : { 'stats' : <stats>,
+        #                                                 <thread_id> : { 'stats' : <stats>},
+        #                                                 ...
+        #                                               },
+        #                               ...
+        #                             }
+        strgp_tbl = {'stats' : self.__datatbl_new()}
+
+        for strgp_name, strgp in d.items():
+            strgp_tbl[strgp_name] = {'stats' : self.__datatbl_new()}
+
+            for set_name, prdset in strgp['sets'].items():
+                prdset['name'] = set_name
+                schema_name = prdset['schema']
+                thread_id = prdset['thread_id']
+
+                if schema_name not in strgp_tbl[strgp_name]:
+                    strgp_tbl[strgp_name][schema_name] = {'stats' : self.__datatbl_new()}
+                if thread_id not in strgp_tbl[strgp_name][schema_name].keys():
+                    strgp_tbl[strgp_name][schema_name][thread_id] = {'stats' : self.__datatbl_new()}
+
+                if schema_name not in schema_tbl.keys():
+                    schema_tbl[schema_name] = {'stats': self.__datatbl_new()}
+
+                if thread_id not in thread_tbl.keys():
+                    thread_tbl[thread_id] = {'stats' : self.__datatbl_new()}
+                if schema_name not in thread_tbl[thread_id].keys():
+                    thread_tbl[thread_id][schema_name] = {'stats': self.__datatbl_new()}
+
+                self.__datatbl_update(prdset, strgp_tbl[strgp_name], schema_tbl, thread_tbl)
+
+        self.__bounds(strgp_tbl)
+        for k in strgp_tbl.keys():
+            if k == 'stats':
+                continue
+            self.__bounds(strgp_tbl[k])
+            for tid in strgp_tbl[k].keys():
+                if tid == 'stats':
+                    continue
+                self.__bounds(strgp_tbl[k][tid])
+
+        self.__bounds(schema_tbl)
+
+        self.__bounds(thread_tbl)
+        for k in thread_tbl.keys():
+            if k == 'stats':
+                continue
+            self.__bounds(thread_tbl[k])
+
+        return (strgp_tbl, schema_tbl, thread_tbl)
+
+    def __symbols(self, key, stats):
+        symbol = list()
+        if key == stats['min_member']:
+            symbol.append("<")
+        if key == stats['max_member']:
+            symbol.append(">")
+        if key == stats['min_avg_member']:
+            symbol.append("-")
+        if key == stats['max_avg_member']:
+            symbol.append("+")
+        return "".join(symbol)
+
+    def do_store_time_stats(self, arg):
+        """
+        Get the store time statistics of a storage policy
+
+         - Storage Policy is the storage policy name.
+         - Min(usec), Max(usec), Avg(usec) are the minumum, maximum, and average times
+           the storage policy spent to store a set in microseconds.
+         - Count is the number of samples used to calculate the minimum, maximum, and average values.
+         - Number of Sets is the number of sets the storage policy is responsible to store.
+
+        Parameters:
+            [name=]    a storage policy name
+            [reset=]   If 'true', reset the statistics after returning the values.
+                       The default is false.
+        """
+        arg = self.handle_args('store_time_stats', arg)
+        rc, msg = self.comm.store_time_stats(**arg)
+        if rc != 0:
+            # self.handle() already reported the error.
+            return
+        j = fmt_status(msg)
+
+        try:
+            strgp_tbl, schema_tbl, thread_tbl = self.__store_time_process(j)
+        except:
+            raise
+
+        # Schema Table
+        print(f"{'='*(4+21+16+16+16+21+21+11+11)}")
+        print(f"   <   Minimum Value          -   Minimum Average value")
+        print(f"   >   Maximum Value          +   Maximum Average value")
+        print(f"{'='*(4+21+16+16+16+21+21+11+11)}")
+        print(f"{' '*4} {'Schema':^20} {'Min (sec)':^15} {'Avg (sec)':^15} {'Max (sec)':^15} {'Min Timestamp':^20} {'Max Timestamp':^20} {'# of Sets':^10} {'Count':^10}")
+        print(f"{'-'*4}-{'-'*20} {'-'*15} {'-'*15} {'-'*15} {'-'*20} {'-'*20} {'-'*10} {'-'*10}")
+        schema_names = sorted(list(schema_tbl.keys()))
+        for schema in schema_names:
+            if schema == 'stats':
+                continue
+            stats = schema_tbl[schema]['stats']
+            print(f"{self.__symbols(schema, schema_tbl['stats']):>4}   {schema:>18} {stats['min']:15.4f} {stats['avg']:15.4f} {stats['max']:15.4f} {stats['min_ts']:20.4f} {stats['max_ts']:20.4f} {len(set(stats['set_name'])):10} {stats['count']:10}")
+
+        # Thread Table
+        print(f"{'='*(4+21+16+16+16+21+21+11+11)}")
+        print(f"{' '*4}-{'Thread':^20} {'Min (sec)':^15} {'Avg (sec)':^15} {'Max (sec)':^15} {'Min Timestamp':^20} {'Max Timestamp':^20} {'# of Sets':^10} {'Count':^10}")
+        # print(f"{'-'*4} {'-'*20} {'-'*15} {'-'*15} {'-'*15} {'-'*20} {'-'*20} {'-'*10} {'-'*10}")
+        threads = sorted(list(thread_tbl.keys()))
+        for tid in threads:
+            if tid == 'stats':
+                continue
+            symbol_tid = list()
+            stats = thread_tbl[tid]['stats']
+            print(f"{'-'*4}-{'-'*20} {'-'*15} {'-'*15} {'-'*15} {'-'*20} {'-'*20} {'-'*10} {'-'*10}")
+            print(f"{self.__symbols(tid, thread_tbl['stats']):>4}   {tid:18} {stats['min']:15.4f} {stats['avg']:15.4f} {stats['max']:15.4f} {stats['min_ts']:20.4f} {stats['max_ts']:20.4f} {len(set(stats['set_name'])):10} {stats['count']:10}")
+            schema_names = sorted([s for s in list(thread_tbl[tid].keys()) if s != 'stats'])
+            print(f"{' '*4} {'-'*20} {'-'*15} {'-'*15} {'-'*15} {'-'*20} {'-'*20} {'-'*10} {'-'*10}")
+            for schema in schema_names:
+                st = thread_tbl[tid][schema]['stats']
+                print(f"   {self.__symbols(schema, thread_tbl[tid]['stats']):>4} {schema:>18} {st['min']:15.4f} {st['avg']:15.4f} {st['max']:15.4f} {st['min_ts']:20.4f} {st['max_ts']:20.4f} {len(set(st['set_name'])):10} {stats['count']:10}")
+            # print(f"{'-'*(4+21+16+16+16+21+21+11+11)}")
+
+        # Storage policy Table
+        print(f"{'='*(4+21+16+16+16+21+21+11+11)}")
+        print(f"{' '*4} {'Storage Policy':^20} {'Min (sec)':^15} {'Avg (sec)':^15} {'Max (sec)':^15} {'Min Timestamp':^20} {'Max Timestamp':^20} {'# of Sets':^10} {'Count':^10}")
+        print(f"{'-'*4}-{'-'*20} {'-'*15} {'-'*15} {'-'*15} {'-'*20} {'-'*20} {'-'*10} {'-'*10}")
+        strgps = sorted(list(strgp_tbl.keys()))
+        for strgp in strgps:
+            if strgp == 'stats':
+                continue
+            stats = strgp_tbl[strgp]['stats']
+            print(f"{self.__symbols(strgp, strgp_tbl['stats']):>5}  {strgp:18} {stats['min']:15.4f} {stats['avg']:15.4f} {stats['max']:15.4f} {stats['min_ts']:20.4f} {stats['max_ts']:20.4f} {len(set(stats['set_name'])):10} {stats['count']:10}")
+            schemas = sorted([s for s in list(strgp_tbl[strgp].keys()) if s != 'stats'])
+            for schema in schemas:
+                print(f"   {' '*2}{'-'*20} {'-'*15} {'-'*15} {'-'*15} {'-'*20} {'-'*20} {'-'*10} {'-'*10}")
+                sch_stats = strgp_tbl[strgp][schema]['stats']
+                print(f"   {self.__symbols(schema, strgp_tbl[strgp]['stats']):>5} {schema:16} {sch_stats['min']:15.4f} {sch_stats['avg']:15.4f} " \
+                      f"{sch_stats['max']:15.4f} {sch_stats['min_ts']:20.4f} {sch_stats['max_ts']:20.4f} " \
+                      f"{len(set(sch_stats['set_name'])):10} {stats['count']:10}")
+                threads = sorted([s for s in list(strgp_tbl[strgp][schema].keys()) if s != 'stats'])
+                for tid in threads:
+                    st = strgp_tbl[strgp][schema][tid]['stats']
+                    print(f"       {self.__symbols(tid, strgp_tbl[strgp][schema]['stats']):>5}{tid:>13} {st['min']:15.4f} {st['avg']:15.4f} " \
+                          f"{st['max']:15.4f} {st['min_ts']:20.4f} {st['max_ts']:20.4f} " \
+                          f"{len(set(st['set_name'])):10} {stats['count']:10}")
+            print(f"{' '*5}  {'-'*18} {'-'*15} {'-'*15} {'-'*15} {'-'*20} {'-'*20} {'-'*10} {'-'*10}")
+
+    def complete_store_time_stats(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('store_time_stats', text)
+
+    def do_plugn_status(self, arg):
+        arg = self.handle_args('plugn_status', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.plugn_status(arg['name'])
+        if rc == 0:
+            plugins = fmt_status(msg)
+            print("Name         Type         Interval     Offset       Libpath")
+            print("------------ ------------ ------------ ------------ ------------")
+            for plugn in plugins:
+                print("{0:12} {1:12} {2:12} {3:12} {4:12}".format(
+                    plugn['name'], plugn['type'],
+                    plugn['sample_interval_us'], plugn['sample_offset_us'],
+                    plugn['libpath']))
+
+    def do_plugn_sets(self, arg):
+        """
+        List the sets by the plugin that provides the sets
+        Parameters:
+        [name=]   The plugin name
+        """
+        arg = self.handle_args('plugn_sets', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.plugn_sets(arg['name'])
+        if msg is None:
+            return
+        if 0 != rc:
+            print(msg)
+            return
+        plugns = fmt_status(msg)
+        if plugns is None or len(plugns) == 0:
+            print("-- None --")
+            return
+        for p in plugns:
+            print("{0}:".format(p['plugin']))
+            for s in p['sets']:
+                print("   {0}".format(s))
+
+    def do_publish(self, arg):
+        """
+        Publish data to the named stream
+        Parameters:
+        name=   The stream name
+        data=   The data to publish
+        """
+        arg = self.handle_args('publish', arg)
+        if arg:
+            rc, msg = self.comm.stream_publish(arg['name'], arg['data'])
+            print(msg)
+
+    def do_subscribe(self, arg):
+        """
+        Subscribe to a stream.
+
+        The aggregator will listen for published data on the specified stream.
+
+        Parameters:
+        name=   The stream name
+        """
+        arg = self.handle_args('subscribe', arg)
+        if arg:
+            rc, msg = self.comm.stream_subscribe(arg['name'])
+            print(rc)
+
+    def do_status(self, arg):
+        """
+        Report the statuses of producers, updaters and storage policies
+        One or more of prdcr, updtr and strgp can be given to limit
+        the status report only for the given types.
+        Example:
+            > status
+        or
+            > status prdcr updtr
+        or
+            > status prdcr name=sampler1
+        """
+        all__ = (len(arg) == 0)
+        if "plugn" in arg or all__:
+            self.do_plugn_status(arg)
+        if "prdcr" in arg or all__:
+            self.do_prdcr_status(arg)
+        if "updtr" in arg or all__:
+            self.do_updtr_status(arg)
+        if "strgp" in arg or all__:
+            self.do_strgp_status(arg)
+
+    def do_term(self, arg):
+        """
+        Unload the plugin
+        Parameters:
+        name=   The plugin name
+        """
+        arg = self.handle_args('term', arg)
+        if arg:
+            rc, msg = self.comm.plugn_term(arg['name'])
+            if rc:
+                print(f'Error terminating plugin {arg["name"]}: {msg}')
+
+    def complete_term(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('term', text)
+
+    def do_config(self, arg):
+        """
+        Send a configuration command to the specified plugin.
+        Parameters:
+        name=   The plugin name
+        ...     Plugin specific attr=value tuples
+        """
+        arg = self.handle_args('config', arg)
+        if arg:
+            rc, msg = self.comm.plugn_config(arg['name'], arg['cfg_str'])
+            if rc:
+                print(f'Error configuring {arg["name"]} plugin: {msg}')
+
+    def complete_config(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('config', text)
+
+    def do_start(self, arg):
+        """
+        Start a sampler plugin
+        Parameters:
+        name=     The plugin name
+        interval= The sample interval in microseconds
+        [offset=] Optional offset (shift) from the sample mark in microseconds.
+                  Offset can be positive or negative with magnitude up to 1/2
+                  the sample interval. If this offset is specified, including 0,
+                  collection will be synchronous; if the offset is not specified,
+                  collection will be asynchronous.
+        """
+        arg = self.handle_args('start', arg)
+        if arg:
+            rc, msg = self.comm.plugn_start(arg['name'], arg['interval'], arg['offset'])
+            if rc:
+                print(f'Error starting {arg["name"]} plugin: {msg}')
+
+    def complete_start(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('start', text)
+
+    def do_stop(self, arg):
+        """
+        Stop a sampler plugin
+        Parameters:
+        name=     The plugin name
+        """
+        arg = self.handle_args('stop', arg)
+        if arg:
+            rc, msg = self.comm.plugn_stop(arg['name'])
+            if rc:
+                print(f'Error stopping {arg["name"]} plugin: {msg}')
+
+    def complete_stop(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('stop', text)
+
+    def do_udata(self, arg):
+        """
+        Set the user data value for a metric in a metric set. This is typically used to
+        convey the Component Id to the Aggregator.
+        Parameters:
+        instance=   The instance name
+        metric= The metric name
+        udata=  The desired user-data. This is a 64b unsigned integer.
+        """
+        arg = self.handle_args('udata', arg)
+        if arg:
+            rc, msg = self.comm.set_udata(arg['instance'], arg['metric'], arg['udata'])
+            if rc:
+                print(f'Error setting udata: {msg}')
+
+    def complete_udata(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('udata', text)
+
+    def do_udata_regex(self, arg):
+        """
+        Set the user data of multiple metrics using regular expression.
+        The user data of the first matched metric is set to the base value.
+        The base value is incremented by the given 'incr' value and then
+        sets to the user data of the consecutive matched metric and so on.
+        Parameters:
+             instance=      The instance name
+             regex=         A regular expression to match metric names to be set
+             base=          The base value of user data (uint64)
+             [incr=]        Increment value (int). The default is 0. If incr is 0,
+                            the user data of all matched metrics are set
+                            to the base value.
+        """
+        arg = self.handle_args('udata_regex', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.set_udata_regex(arg['instance'],
+                                            arg['regex'],
+                                            arg['base'],
+                                            arg['incr'])
+        if rc:
+            print(f'Error setting udata with regex {arg["regex"]}: {msg}')
+
+    def complete_udata_regex(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('udata_regex', text)
+
+    def __log_level(self, arg):
+        arg = self.handle_args('log_level', arg)
+        if arg:
+            rc, msg = self.comm.log_level(arg['level'], arg['name'], arg['regex'])
+            if rc:
+                print(f'Error changing log level: {msg}')
+
+    def do_loglevel(self, arg):
+        """
+        Changing the verbosity level of ldmsd loggers
+
+        If neither 'name' or 'regex' is given, the command will change the default log level.
+
+        Parameters:
+           level=    The choices are "default", "quiet",
+                     a comma-separated list of DEBUG, INFO, WARN, ERROR, and CRITICAL.
+                    It is case insensitive.
+
+                     Note that "<level>," and "<level>" give different results.
+                     "<level>" -- a single level name -- set the log level
+                     to the given level and all the more severity levels.
+                     In contrast, "<level>," -- a level name followed by a comma --
+                     set the log level to only the given level.
+           [name=]   A logger name
+           [regex=]  A regular expression matching logger names,
+                     e.g., xprt.* to change the transport-related log levels.
+        """
+        print(f'`loglevel` is being deprecated. Please use `log_level` in the future.')
+        self.__log_level(arg)
+
+    def complete_loglevel(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('log_level', text)
+
+    def do_log_level(self, arg):
+        """
+        Changing the verbosity level of ldmsd loggers
+
+        If neither 'name' or 'regex' is given, the command will change the default log level.
+
+        Parameters:
+           level=    The choices are "default", "quiet",
+                     a comma-separated list of DEBUG, INFO, WARN, ERROR, and CRITICAL.
+                    It is case insensitive.
+
+                     Note that "<level>," and "<level>" give different results.
+                     "<level>" -- a single level name -- set the log level
+                     to the given level and all the more severity levels.
+                     In contrast, "<level>," -- a level name followed by a comma --
+                     set the log level to only the given level.
+           [name=]   A logger name
+           [regex=]  A regular expression matching logger names,
+                     e.g., xprt.* to change the transport-related log levels.
+        """
+        self.__log_level(arg)
+
+    def complete_log_level(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('log_level', text)
+
+    def do_logrotate(self, arg):
+        """
+        Close the current log file, rename it by appending
+	the timestamp in seconds, and then open a new file
+	with the name given at the ldmsd command-line.
+        """
+        rc, msg = self.comm.logrotate()
+        if rc:
+            print(f'Error rotating log: {msg}')
+
+    def complete_logrotate(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('logrotate', text)
+
+    def do_version(self, arg):
+        """
+        Get the LDMS version the running LDMSD bases on.
+        """
+        rc, msg = self.comm.version()
+        if rc == 0:
+            print(f'{msg}')
+
+    def do_include(self, arg):
+        """
+        Include a configuration file
+        Parameters:
+        path=    Path to the configuration file
+        """
+        arg = self.handle_args('include', arg)
+        if arg:
+            rc, msg = self.comm.include_conf(arg['path'])
+            if rc:
+                print(f'{msg}')
+
+    def complete_include(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('include', text)
+
+    def do_env(self, arg):
+        """
+        Set ldmsd environment
+        """
+        arg = self.handle_args('env', arg)
+        if not arg:
+            print(f'No environment variables specified')
+            return
+        rc, msg = self.comm.set_env(arg['cfg_str'])
+        if rc:
+            print(f'Error setting environment variables: {msg}')
+
+    def do_EOF(self, arg):
+        """
+        Ctrl-D will exit the shell
+        """
+        return True
+
+    def do_quit(self, arg):
+        """
+        Quit the LDMSD shell
+        """
+        if self.comm:
+            self.comm.close()
+        return True
+
+    def do_oneshot(self, arg):
+        """
+        Make a sampler plugin to take a sample at a specific time
+        Parameters:
+        name=    Sampler plugin name
+        time=    Timestamp since epoch. If 'now' is given, the sampler plugin will sample data right away.
+        """
+        arg = self.handle_args('oneshot', arg)
+        if arg:
+            rc, msg = self.comm.oneshot(arg['name'], arg['time'])
+            if rc:
+                print(f'Error with oneshot sample: {msg}')
+
+    def complete_oneshot(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('oneshot', text)
+
+    def do_greeting(self, arg):
+        """
+        Say hi to the ldmsd. If name="<string>" is given, ldmsd will echo the string back.
+        If the parameter name is omitted, no responses will be returned.
+        If a keyword 'test' is given, ldmsd will say 'Hi' back. E.g., greeting test.
+        Parameter:
+        [name=]   String that ldmsd will echo back.
+        [offset=]  Number of characters in the response message.
+        [level=]   Number of records in the response message.
+        [test]    'Hi' will be returned.
+        [path]    String 'XXX:YYY:...:ZZZ' will be returned, where 'XXX', 'YYY' and 'ZZZ'
+                  are myhostname of the first producer in the list of each daemon.
+        """
+        arg = self.handle_args('greeting', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.greeting(arg['name'], arg['offset'], arg['level'], arg['test'], arg['path'])
+        if arg["level"] is not None:
+            tbl = bytes(range(0, 256)) # identity mapping tbl
+            for attr in msg:
+                print(attr.attr_value.translate(tbl, delete=b' \x00').decode())
+        elif msg and msg != "":
+            tbl = bytes(range(0, 256)) # identity mapping tbl
+            print(msg[0].attr_value.translate(tbl, delete=b' \x00').decode())
+
+    def complete_greeting(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('greeting', text)
+
+    def do_example(self, arg):
+        # WIP
+        arg = self.handle_args('example', arg)
+        if not arg:
+            return
+
+        rc, msg = self.comm.example(arg['cfg_str'])
+        attr_list = msg
+        print("{0:10} {1:10} {2}".format("ATTR_ID", "VALUE_LENGTH", "VALUE"))
+        print("---------- ---------- ----------")
+        for attr in attr_list:
+            print("{0:10} {1:10} {2}".format(attr['attr_id'], attr['attr_len'], attr['attr_value']))
+
+    def do_failover_config(self, arg):
+        """Configure LDMSD failover.
+
+        Parameters:
+            host=               The host name of the failover partner.
+                                This is optional in re-configuration.
+            xprt=               The transport of the failover partner.
+                                This is optional in re-configuration.
+            port=               The LDMS port of the failover partner.
+                                This is optional in re-configuration.
+            [auto_switch=0|1]   Auto switching (failover/failback).
+            [interval=]         The interval of the heartbeat.
+            [timeout_factor=]   The hearbeat timeout factor.
+            [peer_name=]        The failover partner name. If not given,
+                                the ldmsd will accept any partner.
+        """
+        arg = self.handle_args('failover_config', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.failover_config(arg['host'],
+                                            arg['xprt'],
+                                            arg['port'],
+                                            arg['auto_switch'],
+                                            arg['interval'],
+                                            arg['timeout_factor'],
+                                            arg['peer_name'])
+        if rc:
+            print(f'Error with failover config: {msg}')
+
+    def complete_failover_config(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('failover_config', text)
+
+    def do_failover_start(self, arg):
+        """Start LDMSD failover service.
+
+        NOTE: After the failover service has started, aggregator configuration
+        objects (prdcr, updtr, and strgp) are not allowed to be altered (start,
+        stop, or reconfigure).
+        """
+        rc, msg = self.comm.failover_start()
+        if rc:
+            print(f'Error starting failover service: {msg}')
+
+    def complete_failover_start(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('failover_start', text)
+
+    def do_failover_stop(self, arg):
+        """Stop LDMSD failover service."""
+        rc, msg = self.comm.failover_stop()
+        if rc:
+            print(f'Error stopping failover service: {msg}')
+
+    def complete_failover_stop(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('failover_stop', text)
+
+    def do_failover_status(self, arg):
+        """Get failover status."""
+        rc, msg = self.comm.failover_status()
+        if rc != 0:
+            print("Request returned error {0}: {1}".format(rc, msg))
+            return
+
+        fobj = fmt_status(msg)
+        # print fobj['attr']
+        print('Failover Status:')
+        keys = list(fobj.keys())
+        keys.remove('flags')
+        for k in keys:
+            print('    %s: %s' % (k, str(fobj[k])))
+        print('    flags: ')
+        for fl, v in fobj['flags'].items():
+            print('        %s: %s' % (fl, str(v)))
+
+    def complete_failover_mod(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('failover_mod', text)
+
+    def do_failover_peercfg_start(self, arg):
+        """Manually start peer configuration."""
+        rc, msg = self.comm.failover_peercfg_start()
+        if rc:
+            print(f'Error starting failover peer configuration: {msg}')
+
+    def do_failover_peercfg_stop(self, arg):
+        """Manually stop peer configuration."""
+        rc, msg = self.comm.failover_peercfg_stop()
+        if rc:
+            print(f'Error stopping failover peer configuration: {msg}')
+
+    def do_setgroup_add(self, arg):
+        """Create a new setgroup.
+
+        Parameters:
+            name=           The set group name.
+            [producer=]     The producer name of the set group.
+            [interval=]     The update interval hint (in usec).
+            [offset=]       The update offset hint (in usec).
+            [perm=]         The permission to modify the setgroup in the future.
+        """
+        arg = self.handle_args('setgroup_add', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.setgroup_add(arg['name'],
+                                         arg['producer'],
+                                         arg['interval'],
+                                         arg['offset'],
+                                         arg['perm'])
+        if rc:
+            print(f'Error creating new set group {arg["name"]}: {msg}')
+
+    def complete_setgroup_add(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('setgroup_add', text)
+
+    def do_setgroup_mod(self, arg):
+        """Modify attributes of a set group.
+
+        Parameters:
+            name=           The set group name.
+            [interval=]     The update interval hint (in usec).
+            [offset=]       The update offset hint (in usec).
+        """
+        arg = self.handle_args('setgroup_mod', arg)
+        if not arg:
+           return
+        rc, msg = self.comm.setgroup_mod(arg['name'],
+                                         arg['interval'],
+                                         arg['offset'])
+        if rc:
+            print(f'Error modifying set group {arg["name"]}: {msg}')
+
+    def complete_setgroup_mod(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('setgroup_mod', text)
+
+    def do_setgroup_del(self, arg):
+        """Delete a set group
+
+        Parameters:
+            name=    The set group name to delete.
+        """
+        arg = self.handle_args('setgroup_del', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.setgroup_del(arg['name'])
+        if rc:
+            print(f'Error deleting set {arg["name"]}: {msg}')
+
+    def complete_setgroup_del(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('setgroup_del', text)
+
+    def do_setgroup_ins(self, arg):
+        """Insert sets into the set group
+
+        Parameters:
+            name=     The set group name.
+            instance= The comma-separated list of set instances to add.
+        """
+        arg = self.handle_args('setgroup_ins', arg)
+        if arg:
+            rc, msg = self.comm.setgroup_ins(arg['name'], arg['instance'])
+            if rc:
+                print(f'Error inserting sets into group: {msg}')
+
+    def complete_setgroup_ins(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('setgroup_ins', text)
+
+    def do_setgroup_rm(self, arg):
+        """Remove sets from the set group
+
+        Parameters:
+            name=     The set group name.
+            instance= The comma-separated list of set instances to remove.
+        """
+        arg = self.handle_args('setgroup_rm', arg)
+        if arg:
+            rc, msg = self.comm.setgroup_rm(arg['name'], arg['instance'])
+            if rc:
+                print(f'Error removing sets from group: {msg}')
+
+    def complete_setgroup_rm(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('setgroup_rm', text)
+
+    def complete_example(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('example', text)
+
+    def __ts2human(self, sec, usec):
+        ts = float(sec)
+        ts_sec = datetime.fromtimestamp(ts).strftime('%m-%d-%y %H:%M:%S')
+        ts_str = "{0} [{1}]".format(ts_sec, usec)
+        return ts_str
+
+    def __floatts2human(self, ts):
+        if ts == 0:
+            return "-EMPTY-"
+        max_ts = float(int.from_bytes(b'\xff'*7+b'\x7f', 'little'))
+        if ts >= max_ts:
+            return "-EMPTY-"
+        sec = int(ts)
+        usec = int(ts % 1.0 * 1000000)
+        return self.__ts2human(sec, usec)
+
+    def do_set_route(self, arg):
+        """
+        Display the route of the set from aggregators to the sampler daemon.
+        Parameters:
+        instance=   Set instance name
+        """
+        arg = self.handle_args('set_route', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.set_route(arg['instance'])
+        attr_list = msg
+        if attr_list is None:
+            print("No response back")
+
+        if attr_list[0].attr_id != LDMSD_Req_Attr.JSON:
+            # Assume that this is an error message
+            return
+
+        try:
+            src = json.loads(attr_list[0].attr_value)
+            route = src['route']
+            print("---------------------")
+            print("instance: '{0}'".format(src['instance']))
+            print("schema: '{0}'".format(src['schema']))
+            print("=====================")
+            print("{0:20} {1:15} {2:15} {3:15} {4:10} {5:10} {6:5} {7:25} {8:25}".format(
+                "host", "type", "name", "prdcr_host", "interval", "offset", "sync", "start", "end"))
+            print("-------------------- --------------- --------------- --------------- "
+                    "---------- ---------- ----- ------------------------- -------------------------")
+            for hop in route:
+                detail = hop['detail']
+                if hop['type'] == "producer":
+                    print("{0:20} {1:15} {2:15} {3:15} {4:10} {5:10} {6:5} {7:25} {8:25}".format(
+                        hop['host'], hop['type'], detail['name'], detail['host'], detail['update_int'],
+                        detail['update_off'], detail['update_sync'],
+                        self.__ts2human(detail['last_start_sec'], detail['last_start_usec']),
+                        self.__ts2human(detail['last_end_sec'], detail['last_end_usec'])))
+                else:
+                    print("{0:20} {1:15} {2:15} {3:15} {4:10} {5:10} {6:5} {7:25} {8:25}".format(
+                        hop['host'], hop['type'], detail['name'], "---", detail['interval_us'],
+                        detail['offset_us'], detail['sync'],
+                        self.__ts2human(detail['trans_start_sec'], detail['trans_start_usec']),
+                        self.__ts2human(detail['trans_end_sec'], detail['trans_end_usec'])))
+        except:
+            raise
+
+    def complete_set_route(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('set_info', text)
+
+    def display_thread_stats(self, stats):
+        print(f"{'Name':16} {'Samples':12} {'Sample Rate':12} " \
+              f"{'Utilization':12} {'Send Queue Size':16} " \
+              f"{'Num of EPs':12}")
+        print("---------------- ------------ ------------ ------------ "\
+              "---------------- ------------")
+        for e in stats['entries']:
+            print(f"{e['name']:16} {e['sample_count']:12.0f} " \
+                  f"{e['sample_rate']:12.2f} {e['utilization'] * 100:12.2f} " \
+                  f"{e['sq_sz']:16} {e['n_eps']:12}")
+
+    def do_thread_stats(self, arg):
+        """
+        Query the IO thread utilization statistics
+
+        The column descriptions are;
+          Samples is the total number of samples from the start or from the last reset until the query;
+          Sample Rate is the frequency of epoll waking up from the start or the last reset until the query;
+          Utilization is the ratio of the active time over a time window of each IO thread.
+          Send Queue Size is the number of send requests pending in the send queue.
+          Number of EPs is the number of connections (endpoints) each IO thread is responsible for.
+
+        Parameters:
+           [reset=]    If 'true', reset the statistics after returning the value. The default is false.
+        """
+        arg = self.handle_args('thread_stats', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.thread_stats(arg['reset'])
+        if msg == "":
+            return
+        if rc != 0:
+            return
+        msg = fmt_status(msg)
+        self.display_thread_stats(msg)
+
+    def complete_thread_stats(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('thread_stats', text)
+
+    def display_prdcr_stats(self, stats):
+        """
+        {
+            "prdcr_count" : <int>,
+            "stopped" : <int>,
+            "disconnected" : <int>,
+            "connecting" : <int>,
+            "connected" : <int>,
+            "stopping"	: <int>,
+            "compute_time" : <int>
+        }
+        """
+        print(f"Producer Stats - {stats['compute_time']}us")
+        print(f"{'Name':20} {'Count':16}")
+        print("-------------------- ----------------")
+        for n in stats:
+            if n == 'compute_time':
+                continue
+            print(f"{n:20} {stats[n]:16}")
+
+    def do_prdcr_stats(self, arg):
+        """
+        Query the daemon's producer statistics
+        """
+        rc, msg = self.comm.prdcr_stats()
+        if msg == "":
+            return
+        if rc != 0:
+            return
+        stats = fmt_status(msg)
+        self.display_prdcr_stats(stats)
+
+    def complete_prdcr_stats(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_stats', text)
+
+    def display_set_stats(self, stats):
+        """
+        {
+            "set_count" : <int>,
+            "deleting_count" : <int>,
+            "mem_total" : <int>,
+            "mem_used" : <int>,
+            "mem_free" : <int>,
+            "compute_time" : <int>
+        }
+        """
+        print(f"Set Stats - {stats['compute_time']}us")
+        print(f"{'Name':20} {'Count':16}")
+        print("-------------------- ----------------")
+        for n in stats:
+            if n == 'compute_time':
+                continue
+            print(f"{n:20} {stats[n]:16}")
+
+    def do_set_stats(self, arg):
+        """
+        Query the daemon's set statistics
+        """
+        rc, msg = self.comm.set_stats()
+        if msg == "":
+            return
+        if rc != 0:
+            print(f'Error {rc} {msg}')
+            return
+        stats = fmt_status(msg)
+        self.display_set_stats(stats)
+
+    def complete_set_stats(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('set_stats', text)
+
+    def display_xprt_stats(self, stats):
+        """
+        { 'compute_time_us': 33,
+          'connect_rate_s': 8e-06, 'connect_request_rate_s': 0.003638,
+          'disconnect_rate_s': 0.003632, 'reject_rate_s': 0.0,
+          'auth_fail_rate_s': 0.0, 'xprt_count': 32,
+          'connect_count': 7, 'connecting_count': 0, 'listen_count': 1,
+          'close_count': 24,
+          'duration': 12353.23,
+          'op_stats': {
+            'LOOKUP': {'count': 3187, 'total_us': 162961103,
+                        'min_us': 308, 'min_peer': '10.10.0.92:10001',
+                        'min_peer_type': 'sock',
+                        'max_us': 3290463, 'max_peer': '10.10.0.91:10001',
+                        'max_peer_type': 'sock', 'mean_us': 51133},
+            'UPDATE': {...},
+            'PUBLISH': {...},
+            'SET_DELETE': {...},
+            'DIR_REQ': {...},
+            'DIR_REP': {...},
+            'SEND': {...},
+            'RECV': {...}
+          }
+        }
+        """
+        heading = f"Summary over {stats['duration']:.2f} seconds"
+        print(f"{heading:^64s}")
+        print(f"{'Connected':12s} {'Connecting':12s} {'Listening':12s} {'Close':12s}")
+        print("------------ ------------ ------------ ------------")
+        print(f"{stats['connect_count']:12} {stats['connecting_count']:12} "
+            f"{stats['listen_count']:12} {stats['close_count']:12}")
+        print("")
+        print(f"{'Rate/s':^64s}")
+        print(f"{'Connect':12} {'Conn Req':12} {'Disconnect':12} {'Reject':12} {'Auth Fail':12}")
+        print("------------ ------------ ------------ ------------ ------------")
+        print(f"{stats['connect_rate_s']:12.2f} "
+            f"{stats['connect_request_rate_s']:12.2f} "
+            f"{stats['disconnect_rate_s']:12.2f} "
+            f"{stats['reject_rate_s']:12.2f} "
+            f"{stats['auth_fail_rate_s']:12.2f} "
+            )
+        print("")
+        print(f"{'Operation':12} {'Count':12} {'Min(us)':12} {'Mean(us)':12} {'Max(us)':12} ")
+        print("------------ ------------ ------------ ------------ ------------")
+        op_stats = stats['op_stats']
+        for op_name in op_stats:
+            s = op_stats[op_name]
+            print(f"{op_name:12} {s['count']:12} {s['min_us']:12} {s['mean_us']:12} {s['max_us']:12}")
+
+    def do_xprt_stats(self, arg):
+        """
+        Query the daemon's transport telemetry data
+
+        Parameters:
+        [reset=]  If true, reset the statistics after returning them
+        """
+        arg = self.handle_args('xprt_stats', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.xprt_stats(arg['reset'])
+        if msg == "":
+            return
+        if rc != 0:
+            print(f'Error: {rc} {msg}')
+            return
+        stats = fmt_status(msg)
+        self.display_xprt_stats(stats)
+
+    def complete_xprt_stats(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('xprt_stats', text)
+
+    def do_updtr_task(self, arg):
+        """
+        Report the updater tasks
+        Parameters:
+        [name=]   Updater name
+        """
+        arg = self.handle_args('updtr_task', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.updtr_task(arg['name'])
+        if msg == "":
+            return
+        if rc != 0:
+            return
+        updtrs = fmt_status(msg)
+        for updtr in updtrs:
+            print("Updater : {0}".format(updtr['name']))
+            print("   tasks: <interval_us>:<offset_us>")
+            tasks = updtr['tasks']
+            for task in tasks:
+                if task['default_task'] == "true":
+                    print("     {0}:{1}   default".format(task['interval_us'], task['offset_us']))
+                else:
+                    print("     {0}:{1}".format(task['interval_us'], task['offset_us']))
+
+    def complete_updtr_task(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('updtr_task', text)
+
+    def do_prdcr_hint_tree(self, arg):
+        """
+        Report the update hints of all producer sets
+        Parameters:
+        [name=]   Producer name
+        """
+        arg = self.handle_args('prdcr_hint_tree', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.prdcr_hint_tree(arg['name'])
+        if msg == None or msg == '':
+            return
+        if rc != 0:
+            return
+        prdcrs = fmt_status(msg)
+        for prdcr in prdcrs:
+            print("prdcr: {0}".format(prdcr['name']))
+            hints = prdcr['hints']
+            for hint in hints:
+                print("   update hint: {0}:{1}".format(hint['interval_us'],
+                                                       hint['offset_us']))
+                sets = hint['sets']
+                for s in sets:
+                    print("      {0}".format(s))
+
+    def complete_prdcr_hint_tree(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_hint_tree', text)
+
+    def do_stream_client_dump(self, arg):
+        """
+        Dump stream client information (for debugging)
+
+        No parameters
+        """
+        rc, msg = self.comm.stream_client_dump()
+        if not msg:
+            raise RuntimeError("no response")
+        obj = fmt_status(msg)
+        print(f"{'stream':15} {'ctxt':15} {'cb_fn':70}")
+        print(f"{'-'*15} {'-'*15} {'-'*70}")
+        for s in obj['streams']:
+            print(f"{s['name']:15}", end = None)
+            for c in s['clients']:
+                print(f"{'':15} {c['ctxt']:15} {c['cb_fn']:70}")
+
+    def complete_stream_client_dump(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('stream_client_dump', text)
+
+    def do_stream_status(self, arg):
+        """
+        Dump the stream information
+
+        Parameters:
+        [reset=]     If true, reset the statistics of all streams after returning the values.
+                     The default is false.
+        """
+        print("stream_status is deprecated")
+        return
+        # DEPRECATED
+        FIRST = "first_ts"
+        LAST = "last_ts"
+        RATE = "bytes/sec"
+        FREQ = "msg/sec"
+
+        def dur(info):
+            return (info[LAST] - info[FIRST])/60.0
+
+        def rate(info):
+            if not info or RATE not in info.keys():
+                return "-"
+            return info[RATE]
+
+        def freq(info):
+            if not info or FREQ not in info.keys():
+                return "-"
+            return info[FREQ]
+
+        def total_bytes(info):
+            if not info or "total_bytes" not in info.keys():
+                return "-"
+            return info["total_bytes"]
+
+        def count(info):
+            if not info or "count" not in info.keys():
+                return "-"
+            return info["count"]
+
+        def first(info):
+            if not info or "first_ts" not in info.keys():
+                return "-"
+            return info["first_ts"]
+
+        def last(info):
+            if not info or "last_ts" not in info.keys():
+                return "-"
+            return info["last_ts"]
+
+        arg = self.handle_args('stream_status', arg)
+        if not arg:
+            return
+
+        rc, msg = self.comm.stream_status(arg['reset'])
+        if msg is None:
+            raise RuntimeError("no response")
+        if (rc == 0):
+            streams = fmt_status(msg)
+            print(f'{"name":30} {"bytes/sec":12} {"msg/sec":12} {"total bytes":12} {"msg count":12} {"first msg":12} {"last msg":12}')
+            print("-" * 30, "-" * 12, "-" * 12, "-" * 12, "-" * 12, "-" * 12, "-" * 12)
+            # print("--------------- -------------- --------------- ----- ----------------- -----------\n")
+            for name,s in streams.items():
+                if name == "_OVERALL_":
+                    # Skip the _OVERALL_ because it is confusing.
+                    continue
+                else:
+                    print(f"{name} ({s['mode']})")
+
+                print(f"{'   published':<30} {rate(s['pub']):>12} {freq(s['pub']):>12} {total_bytes(s['pub']):>12} {count(s['pub']):>12} {first(s['pub']):>12} {last(s['pub']):>12}")
+                print(f"{'   received':<30} {rate(s['recv']):>12} {freq(s['recv']):>12} {total_bytes(s['recv']):>12} {count(s['recv']):>12} {first(s['recv']):>12} {last(s['recv']):>12}")
+                if 'publishers' not in s.keys() or len(s['publishers']) == 0:
+                    continue
+                print("      Producers")
+                for name,p in s['publishers'].items():
+                    print(f"{' '*14} {name:15} {rate(p['recv']):>12} {freq(p['recv']):>12} {total_bytes(p['recv']):>12} {count(p['recv']):>12} {first(p['recv']):>12} {last(p['recv']):>12}")
+
+    def complete_stream_status(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('stream_status', text)
+
+    def do_stream_stats(self, arg):
+        """
+        Print stream stats that match the given `regex` or `stream`.
+
+        Parameters:
+            [regex=]  The regular expression to match the stream name
+            [stream=] The exact stream name
+            [json=1]  Set the output format to JSON
+        """
+        arg = self.handle_args('stream_stats', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.stream_stats(arg['regex'], arg['stream'])
+        if rc:
+            emsg = f"stream_stats error: {rc}, msg: {msg}"
+            print(emsg)
+            if is_debug:
+                raise RuntimeError(emsg)
+        streams = fmt_status(msg)
+        if arg.get('json'):
+            print(json.dumps(streams, indent=1))
+            return
+        # header
+        print(f'{"name":30} {"bytes":12} {"count":12} {"first":26} {"last":26}')
+        print("-" * 30, "-" * 12, "-" * 12, "-" * 26, "-" * 26)
+        for s in streams:
+            name    = s["name"]
+            rx      = s["rx"]
+            sources = s.get("sources", dict())
+            clients = s.get("clients", list())
+            print(f'{name:30} {rx["bytes"]:>12} {rx["count"]:>12} '\
+                  f'{self.__floatts2human(rx["first_ts"]):26} ' \
+                  f'{self.__floatts2human(rx["last_ts"]):26}')
+            first_src = True
+            first_cli = True
+            for addr, rx in sources.items():
+                if first_src:
+                    print(" - sources:")
+                    first_src = False
+                print(f'   - {addr:25} {rx["bytes"]:>12} {rx["count"]:>12} '\
+                      f'{self.__floatts2human(rx["first_ts"]):26} ' \
+                      f'{self.__floatts2human(rx["last_ts"]):26}')
+            for cli in clients:
+                if first_cli:
+                    print(" - clients:")
+                    first_cli = False
+                name = f"[{cli['client_match']}] {cli['client_desc']}"
+                tx = cli['tx']
+                drops = cli['drops']
+                print(f'   - {name+":":25}')
+                print(f'     - {"tx":23} {tx["bytes"]:>12} {tx["count"]:>12} '\
+                      f'{self.__floatts2human(tx["first_ts"]):26} ' \
+                      f'{self.__floatts2human(tx["last_ts"]):26}')
+                print(f'     - {"drops":23} {drops["bytes"]:>12} {drops["count"]:>12} '\
+                      f'{self.__floatts2human(drops["first_ts"]):26} ' \
+                      f'{self.__floatts2human(drops["last_ts"]):26}')
+        if is_debug:
+            pdb.set_trace()
+
+    def complete_stream_stats(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('stream_stats', text)
+
+    def do_stream_client_stats(self, arg):
+        """
+        Print stream stats
+
+        Parameters:
+            [json=1]  Set the output format to JSON
+        """
+        arg = self.handle_args('stream_stats', arg)
+        if arg is None:
+            return
+        rc, msg = self.comm.stream_client_stats()
+        if rc:
+            emsg = f"stream_client_stats error: {rc}, msg: {msg}"
+            print(emsg)
+            if is_debug:
+                raise RuntimeError(emsg)
+        clients = fmt_status(msg)
+        if arg.get('json'):
+            print(json.dumps(clients, indent=1))
+            return
+        print(f'{"name":30} {"bytes":12} {"count":12} {"first":26} {"last":26}')
+        print("-" * 30, "-" * 12, "-" * 12, "-" * 26, "-" * 26)
+        for cli in clients:
+            name = f'[{cli["match"]}] {cli["dest"]} {cli["desc"]}'
+            tx = cli['tx']
+            drops = cli['drops']
+            print(f'{name}')
+            print(f' - {"tx":27} {tx["bytes"]:>12} {tx["count"]:>12} '\
+                  f'{self.__floatts2human(tx["first_ts"]):26} ' \
+                  f'{self.__floatts2human(tx["last_ts"]):26}')
+            print(f' - {"drops":27} {drops["bytes"]:>12} {drops["count"]:>12} '\
+                  f'{self.__floatts2human(drops["first_ts"]):26} ' \
+                  f'{self.__floatts2human(drops["last_ts"]):26}')
+            first_stream = True
+            for s in cli['streams']:
+                if first_stream:
+                    print(" - streams:")
+                    first_stream = False
+                name = s['stream_name']
+                tx = s['tx']
+                drops = s['drops']
+                print(f'   - {name+":":25}')
+                print(f'     - {"tx":23} {tx["bytes"]:>12} {tx["count"]:>12} '\
+                      f'{self.__floatts2human(tx["first_ts"]):26} ' \
+                      f'{self.__floatts2human(tx["last_ts"]):26}')
+                print(f'     - {"drops":23} {drops["bytes"]:>12} {drops["count"]:>12} '\
+                      f'{self.__floatts2human(drops["first_ts"]):26} ' \
+                      f'{self.__floatts2human(drops["last_ts"]):26}')
+        if is_debug:
+            pdb.set_trace()
+
+    def complete_stream_client_stats(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('stream_client_stats', text)
+
+    def do_listen(self, arg):
+        """
+        Add a listen endpoint
+
+        Parameters:
+            xprt=   Transport name [sock, rdma, ugni]
+            port=   Port number
+            [host=] Hostname
+            [auth=] Authenticantion domain.
+                    If this is omitted or auth=auth_default is give,
+                    the default authentication given the command line (-a and -A)
+                    will be used..
+        """
+        arg = self.handle_args('listen', arg)
+        if not arg:
+            return
+        rc, msg = self.comm.listen(arg['xprt'],
+                                   arg['port'],
+                                   arg['host'],
+                                   arg['auth'])
+        if rc:
+            print(f'Error adding listener {arg["xprt"]} on port {arg["port"]}: {msg}')
+
+    def complete_listen(self, text, lien, begidx, endidx):
+        return self.__complete_attr_list('listen', text)
+
+    def do_metric_sets_default_authz(self, arg):
+        """
+        Set the default authorization values for subsequently created metric sets
+
+        Parameters:
+            [uid=]  User ID number or user name string
+            [gid=]  Group ID number or group name string
+            [perm=] Octal number representing the permissions bits
+        """
+        arg = self.handle_args('metric_sets_default_authz', arg)
+        if arg:
+            rc, msg = self.comm.metric_sets_default_authz(arg['uid'], arg['gid'], arg['perm'])
+            if rc:
+                print(f'Error setting default auth values: {msg}')
+            else:
+                print(f'{msg}')
+
+    def complete_metric_sets_default_authz(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('metric_sets_default_authz', text)
+
+    def do_auth_add(self, arg):
+        """
+        Add an authentication domain
+
+        Parameters:
+            name=      The authentication domain name
+            [plugin=]  The authentication plugin [none, ovis, munge]
+                       If this is omitted, the <name> value will be used as
+                       a plugin name.
+            <plugin-specific auth plugin attributes, path=.ldmsauth.conf>
+        """
+        arg = self.handle_args('auth_add', arg)
+        if arg:
+            rc, msg = self.comm.auth_add(arg['name'], arg['plugin'], auth_opt=arg['cfg_str'])
+            if rc:
+                print(f'Error adding authentication domain {arg["name"]}: {msg}')
+
+    def complete_auth_add(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('auth_add', text)
+
+    def do_set_sec_mod(self, arg):
+        """
+        Change the security parameters of the set matched the regular expression
+
+        The configuration command does not affect the sets aggregated from another LDMSD.
+        The new security parameter values will only affect new clients or connections.
+        Then, the aggregators that already have access to the sets will not lose access.
+
+        Parameters:
+           regex=     Regular expression string
+           [uid=]     UID
+           [gid=]     GID
+           [perm=]    Permissions
+        """
+        arg = self.handle_args('set_sec_mod', arg)
+        rc, msg = self.comm.set_sec_mod(regex = arg['regex'],
+                                        uid = arg['uid'],
+                                        gid = arg['gid'],
+                                        perm = arg['perm'])
+        if rc:
+            print(f"Error changing sets' security parameters. {msg}")
+
+    def complete_set_sec_mod(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('set_sec_mod', text)
+
+    def do_log_status(self, arg):
+        """
+        Return the list of loggers and their log level thresholds
+
+        If a name is given, only the log level threashold of the matched logger will be returned.
+
+        Parameters:
+           [name=]    A logger name.
+        """
+        arg = self.handle_args('log_status', arg)
+        rc, msg = self.comm.log_status(name = arg['name'])
+        if rc:
+            print(f"Error getting the logger infomation. {msg}")
+        loggers = fmt_status(msg)
+
+        print(f"{'Name':20} {'Log Level':30} Description")
+        print(f"{'-'*20} {'-'*30} {'-'*30}")
+
+        for l in loggers:
+            print(f"{l['name']:20} {l['level']:30} {l['desc']}")
+        print(f"{'-'*(20 + 30 + 30 + 2)}")
+        print("The loggers with the Log Level as 'default' use the same "
+              "log level as the default logger (ldmsd). When the default log "
+              "level changes, their log levels change accordingly.")
+
+    def do_option(self, arg):
+        """
+        ONLY SUPPORTED IN CONFIGURATION FILES
+        Specify the command-line options
+
+        Parameters:
+            -A, -- defulat_auth_args    Arguments of the default authentication method
+            -a, -- default_auth         Default authentication method
+            -B, --banner                Banner mode: 0=do banner file, 1=auto-delete at exit, 2=keep the file
+            -H, --host_name             Host/producer name used by the kernel metric sets
+            -k, --publish_kernel        Publish kernel: true or false
+            -l, --log_file              Path to the log file or 'syslog'
+            -m, --set_memory            Set memory, e.g., 2GB, 512mB
+            -n, --daemon_name           Daemon name
+            -P, --worker_threads        Number of worker threads
+            -r, --pid_file              Path to the PID file
+            -s, --kernel_set_path       Path to a text file containing the kernel metric values
+            -v, --log_level             Log level: DEBUG, INFO, ERROR, CRITICAL, QUIET
+
+        Use 'listen' instead of the -x option.
+
+        The following options must specified only at the command line.
+            -c        Path to a configuration file
+            -F        Foreground mode
+            -u        List named plugins
+            -V        Print LDMS version
+
+        You would specify the command-line options as if you specify them at
+        the command line.
+
+        Examples:
+           # Specify a short option
+           option -a ovis
+           # Specify multiple short options
+           option -m 2GB -P 16
+           # Specify multiple long options
+           option --log_file /path/to/logfile --log_level ERROR
+        """
+        print("Not supported! The 'option' command is only supported in a configuration file.")
+
+    def parseline(self, line):
+        """Parse the line into a command name and a string containing
+        the arguments.  Returns a tuple containing (command, args, line).
+        'command' and 'args' may be None if the line couldn't be parsed.
+        Allows # comments to begin lines, and dispatches these to do_comment
+        when present.
+        """
+        line = line.strip()
+        if not line:
+            return None, None, line
+        elif line[0] == '?':
+            line = 'help ' + line[1:]
+        elif line[0] == '!':
+            if hasattr(self, 'do_shell'):
+                line = 'shell ' + line[1:]
+            else:
+                return None, None, line
+        elif line[0] == '#':
+            if hasattr(self, 'do_comment'):
+                line = 'comment ' + line[1:]
+            else:
+                return None, None, line
+        i, n = 0, len(line)
+        while i < n and line[i] in self.identchars: i = i+1
+        cmd, arg = line[:i], line[i:].strip()
+        return cmd, arg, line
+
+
+if __name__ == "__main__":
+    is_debug = True
+    try:
+        parser = argparse.ArgumentParser(description="Configure an LDMS Daemon. " \
+                                         "To connect to an ldmsd, either give " \
+                                         "the socket path of the ldmsd or " \
+                                         "give both hostname and inet control port. " \
+                                         "If all are given, the sockname takes the priority.",
+                                         add_help=False)
+        parser.add_argument('-?', '--help', action='help', default='==SUPPRESS==',
+                help='show this help message and exit')
+        parser.add_argument('-h','--host',
+                            help = "Hostname of ldmsd to connect to",
+                            default = 'localhost')
+        parser.add_argument('-p','--port',
+                            help = "Inet ctrl listener port of ldmsd")
+        parser.add_argument('-x','--xprt',
+                            help = "LDMS Transport type",
+                            choices = ['sock', 'ugni', 'rdma', 'fabric'],
+                            default = 'sock')
+        parser.add_argument('--source',
+                            help = "Path to the config file")
+        parser.add_argument('--script',
+                            help = "Execute the script and send the output \
+                            commands to the connected ldmsd")
+        parser.add_argument('--cmd',
+                            help = "Command to be sent to an LDMSD")
+        parser.add_argument('-a', '--auth',
+                            help = "Authentication method.")
+        parser.add_argument('-A', '--auth-arg', action = 'append',
+                            help = "Authentication arguments (name=value). \
+                                    This option can be given multiple times.")
+        parser.add_argument('--debug', action = "store_true",
+                            help = argparse.SUPPRESS)
+
+        args = parser.parse_args()
+
+        is_debug = args.debug
+        if is_debug:
+            import pdb
+
+        auth_opt = None
+        if args.auth_arg:
+            auth_opt = dict()
+            rx = re.compile(r"(\w+)=(.+)")
+            for arg in args.auth_arg:
+                m = rx.match(arg)
+                if not m:
+                    print("Expecting --auth-arg to be NAME=VALUE")
+                    sys.exit(1)
+                (k, v) = m.groups()
+                auth_opt[k] = v
+
+        cmdParser = LdmsdCmdParser(host = args.host,
+                                   port = args.port,
+                                   xprt = args.xprt,
+                                   auth = args.auth,
+                                   auth_opt = auth_opt,
+                                   debug = args.debug)
+
+        if args.source is not None or args.script is not None or args.cmd is not None:
+            if args.source is not None:
+                cmdParser.do_source(args.source)
+            if args.script is not None:
+                cmdParser.do_script(args.script)
+            if args.cmd is not None:
+                cmdParser.onecmd(args.cmd)
+            cmdParser.do_quit(None)
+        else:
+            if sys.stdin.isatty() is False:
+                cmdParser.read_none_tty(sys.stdin)
+                cmdParser.do_quit(None)
+            else:
+                cmdParser.cmdloop("Welcome to the LDMSD control processor")
+                cmdParser.do_quit(None)
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception as e:
+        if is_debug:
+            raise
+        else:
+            print(e)
+            sys.exit(0)

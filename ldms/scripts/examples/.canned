@@ -1,0 +1,59 @@
+# working
+auto-interval
+aggl2 # ldms_ls inconsistent, set duplicates at L2
+aggl2simple
+all_example
+all_example.sos
+array_example
+blob_writer
+clock
+lnet_stats
+ibmad_sampler
+meminfo
+procdiskstats
+procinterrupts
+procnetdev # produces inconsistent sets
+procsensors # produces 0s (hardcoded path)
+procstat
+vmstat
+sequence_unsupp
+synthetic
+edac
+fptrans
+filesingle
+procnfs
+rabbitkw
+rabbitl2remote
+rabbitv3
+renamecsv
+rollagain
+csvcheckattrs # one ok and one failed config_check
+vg_csv
+vg_sos
+shm # store fails because of schema ambiguity
+uidgidcsv
+
+# working with job metrics
+clock.job
+meminfo.job
+procstat.job
+lustre2_client
+lustre_mdc
+dstat.job
+many
+conf_csv
+
+# not yet tested
+rabbitv3
+sampler_atasmart
+opa2
+sysclassib
+sysclassib.job
+
+# crashing due to known bugs
+variable
+
+# not yet implemented
+# vmstat.job
+# procnetdev.job
+# all cray samplers # not generically possible due to lustre site specificity

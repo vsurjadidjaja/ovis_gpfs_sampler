@@ -1,0 +1,4 @@
+#!/bin/sh
+# use of this file is deprecated.
+# it will disappear by version 5
+# only ovis-ldms-configvars.sh is used now.

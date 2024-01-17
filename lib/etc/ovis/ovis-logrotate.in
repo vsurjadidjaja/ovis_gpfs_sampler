@@ -1,0 +1,36 @@
+#!/bin/sh
+
+clean_logrotate_status() {
+	local F=$1
+	local C=$F.clean
+	test -e $F || touch $F
+	head -1 $F > $C
+	sed 's/"//g' $F | while read logfile date
+	do
+	    [ -e "$logfile" ] && echo "\"$logfile\" $date"
+	done >> $C
+	mv $C $F
+}
+
+prefix=@prefix@
+. @sysconfigdir@/profile.d/set-ovis-variables.sh
+
+current=`pwd`
+# Clean non existent log file entries from status file
+cd /var/lib
+if [ -d logrotate ]; then
+	cd logrotate
+	clean_logrotate_status "status"
+else
+	clean_logrotate_status "logrotate.status"
+fi
+
+test -x /usr/sbin/logrotate || exit 0
+cd $OVIS_LOG
+for X in ldmsd_aggregator ldmsd_sampler balerd me komondor ocmd; do
+	if [ -e $X.log ]; then
+		# sysconfdir uses prefix
+		/usr/sbin/logrotate @sysconfdir@/ovis/logrotate.d/$X
+	fi
+done
+cd $current

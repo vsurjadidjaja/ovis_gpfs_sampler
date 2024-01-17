@@ -1,0 +1,53 @@
+.\" Manpage for Plugin_gpfs
+.\" Contact ovis-help@ca.sandia.gov to correct errors or typos.
+.TH man 7 "2024" "v4" "LDMS Plugin gpfs man page"
+
+.SH NAME
+Plugin_gpfs - man page for the LDMS gpfs plugin
+
+.SH SYNOPSIS
+Within ldmsd_controller or a configuration file:
+.br
+config name=gpfs [common attributes] [exclude_mounts=<name>]
+
+.SH DESCRIPTION
+With LDMS (Lightweight Distributed Metric Service), plugins for the ldmsd (ldms daemon) are configured via ldmsd_controller
+or a configuration file. The gpfs plugin provides gpfs info from /usr/lpp/mmfs/bin/mmpmon.....*CONTINUE DISCRIPTION*.
+
+.SH CONFIGURATION ATTRIBUTE SYNTAX
+The gpfs plugin uses the sampler_base base class. This man page covers only the configuration attributes, or those with default values, specific to the this plugin; see ldms_sampler_base.man for the attributes of the base class.
+
+.TP
+.BR config
+name=<plugin_name> exclude_ports=<devs>
+.br
+configuration line
+.RS
+.TP
+name=<plugin_name>
+.br
+This MUST be gpfs.
+.TP
+exclude_ports=<devs>
+.br
+Comma separated list of ports to exclude.
+.TP
+schema=<schema>
+.br
+Optional schema name. If not specified, will default to `gpfs`.
+.RE
+
+.SH BUGS
+Interfaces reported and exclude_ports lists are each limited to 20.
+
+.SH EXAMPLES
+.PP
+Within ldmsd_controller or a configuration file:
+.nf
+load name=gpfs
+config name=gpfs producer=vm1_1 instance=vm1_1/gpfs exclude_ports=lo
+start name=gpfs interval=1000000
+.fi
+
+.SH SEE ALSO
+ldmsd(8), ldms_quickstart(7), ldmsd_controller(8), ldms_sampler_base(7)

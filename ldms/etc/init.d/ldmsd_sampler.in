@@ -1,0 +1,175 @@
+#!/bin/sh
+#
+# ldmsd_sampler This shell script takes care of starting and stopping
+#               ldmsd_sampler (ovis data collector daemon).
+#
+# chkconfig: - 98 0
+# description: ldmsd_sampler is an ovis daemon.
+#
+### BEGIN INIT INFO
+# Provides: ldmsd_sampler
+# Required-Start:
+# Defalt-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Description: ldmsd_sampler init script
+### END INIT INFO
+
+# Source function library.
+if [ -f /lib/lsb/init-functions ] ; then
+	. /lib/lsb/init-functions
+	STATUS=status_of_proc
+fi
+
+if [ -f /etc/init.d/functions ] ; then
+	. /etc/init.d/functions
+	STATUS=status
+else
+	echo_success() {
+		echo 'success'
+	}
+	echo_failure() {
+		echo 'failure'
+	}
+fi
+
+prefix=@prefix@
+. $(sysconfdir)/profile.d/set-ovis-variables.sh
+. $(sysconfdir)/ovis/ovis-functions.sh
+
+if [ -z $OVIS_HOME ]; then
+	OVIS_HOME=@prefix@
+	echo "OVIS_HOME not defined, using default of $OVIS_HOME"
+fi
+
+if [ ! -d $OVIS_HOME ]; then
+	echo "OVIS_HOME: $OVIS_HOME is not a directory"
+	exit 1
+fi
+
+# CMD="ldmsd -l $OVIS_LOG/ldmsd_sampler.log -S $OVIS_SOCK/ldmsd_sampler.sock -x sock:50001 -o 40001 -z ldmsd_sampler"
+
+
+RETVAL=0
+prog="ldmsd"
+service="ldmsd_sampler"
+LDMSD_SAMPLER=$OVIS_HOME/sbin/ldmsd
+if [ -z $LDMSD_SAMPLER_XPORT ] ; then
+	LDMSD_SAMPLER_XPORT=sock
+	echo "LDMSD_SAMPLER_XPORT not set using default of $LDMSD_SAMPLER_XPORT"
+fi
+if [ -z $LDMSD_SAMPLER_PORT_TO_OCMD ] ; then
+	LDMSD_SAMPLER_PORT_TO_OCMD=40001
+	echo "LDMSD_SAMPLER_PORT_TO_OCMD not set using default of $LDMSD_SAMPLER_PORT_TO_OCMD"
+fi
+if [ -z $LDMSD_SAMPLER_PORT_LISTEN ] ; then
+	LDMSD_SAMPLER_PORT_LISTEN=50001
+	echo "LDMSD_SAMPLER_PORT_LISTEN not set using default of $LDMSD_SAMPLER_PORT_LISTEN"
+fi
+
+
+lockfile=$OVIS_HOME/var/lock/$prog.sampler.lock
+pidfile=$OVIS_HOME/var/pid/$prog.sampler.pid
+
+mkdir -p $(dirname $lockfile)
+mkdir -p $(dirname $pidfile)
+mkdir -p $OVIS_SOCK/
+mkdir -p $OVIS_LOG/
+LOG=$OVIS_LOG/ldmsd_sampler.log
+SOCK=$OVIS_SOCK/ldmsd_sampler.sock
+
+start() {
+	echo -n "Starting $service: "
+	pid=`ps -C ldmsd -opid,cmd | grep ldmsd_sampler | sed 's/ *\([0-9]\+\) .*/\1/'`
+
+	if [ $pid ]; then
+		echo -n "$service is already running: "
+		echo_failure
+		echo
+		exit 1
+	fi
+
+	rm -f $SOCK
+
+	$LDMSD_SAMPLER -l $LOG -S $SOCK -x $LDMSD_SAMPLER_XPORT:$LDMSD_SAMPLER_PORT_LISTEN -o $LDMSD_SAMPLER_PORT_TO_OCMD -z ldmsd_sampler
+
+	RETVAL=$?
+	if [ $RETVAL -eq 0 ] ; then
+		sleep 1;
+		ps -C ldmsd -opid,cmd | grep ldmsd_sampler | sed 's/ *\([0-9]\+\) .*/\1/' > $pidfile
+		pid=`cat $pidfile`
+		if [ $pid ] && [ -d /proc/$pid ] ; then
+			echo_success
+			echo
+		else
+			echo_failure
+			echo
+		fi
+	else
+		echo_failure
+		echo
+	fi
+}
+
+stop() {
+	echo -n "Stopping $service: "
+	if [ -f $pidfile ]; then
+		pid=`cat $pidfile`
+	else
+		echo "pidfile of $pidfile doesn't exists, using ps"
+		pid=`ps -C ldmsd -opid,cmd | grep ldmsd_sampler | sed 's/ *\([0-9]\+\) .*/\1/'`
+	fi
+
+	if [ ! $pid ]; then
+		echo "Cannot obtain ldmsd_sampler pid ..."
+		echo_failure
+		echo
+		return
+	else
+		kill $pid
+	fi
+
+	COUNT=$((4*10))
+	while [ -d /proc/$pid ] && [ $COUNT -gt 0 ]; do
+		sleep 0.25
+		COUNT=$((COUNT-1))
+	done
+
+	if ps -p $pid >/dev/null 2>&1 ; then
+		echo_failure
+	else
+		echo_success
+		rm -f $lockfile
+		rm -f $pidfile
+		echo
+	fi
+}
+
+dostatus() {
+	$STATUS -p $pidfile $LDMSD_SAMPLER $service
+}
+
+restart() {
+	stop
+	start
+}
+
+# See how we were called.
+case "$1" in
+  start)
+	start
+	;;
+  stop)
+	stop
+	;;
+  status)
+	dostatus
+	;;
+  restart|reload)
+	restart
+	;;
+  *)
+	echo "Usage: $0 {start|stop|status}"
+	exit 3
+esac
+
+exit $RETVAL
