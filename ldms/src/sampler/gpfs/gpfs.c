@@ -382,63 +382,26 @@ static int sample(struct ldmsd_sampler *self)
 	/* parse all data */
 	do {
 		s = fgets(lbuf, sizeof(lbuf), mf);
-		if (!s)
-			break;
+        char** args = (char**)malloc(NVARS*sizeof(char*));
+        int i = 0;
 
-		char *pch = strchr(lbuf, ':');
-		if (pch != NULL){
-			*pch = ' ';
-		}
+        char* token = strtok(s, " \t");
+        for (int k = 0; token != NULL; k++) {
+                args[k] = strdup(token);
+                token = strtok(NULL, " \t");
+                if(k%2 == 0){
+                    v[i] = args[k];
+                }
+        }
 
-		rc = sscanf(lbuf, "%s %" PRIu64 " %" PRIu64 " %" PRIu64
-				" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
-				" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
-				" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
-				"\n", curriface, &v[0].v_u64,
-				&v[1].v_u64, &v[2].v_u64, &v[3].v_u64,
-				&v[4].v_u64, &v[5].v_u64, &v[6].v_u64,
-				&v[7].v_u64, &v[8].v_u64, &v[9].v_u64,
-				&v[10].v_u64, &v[11].v_u64, &v[12].v_u64,
-				&v[13].v_u64, &v[14].v_u64);
-		if (rc != 15) {
-			ovis_log(mylog, OVIS_LINFO, "wrong number of "
-					"fields in sscanf. skipping line %s\n", lbuf);
-			continue;
-		}
-
-		uint64_t msum = 0;
-		/* don't care if msum rolls; just want to know if it
-		 * changed from prior or is 0. */
-		for (j = 0; j < NVARS; j++)
-			msum += v[j].v_u64;
-
-		int done = 0;
-		for (j = 0; j < n_gpfs; j++) {
-			if (strcmp(curriface, gpfs[j].name) == 0) {
-				if (msum != gpfs[j].last_sum) {
-					rc = update_gpfs(j, msum, v);
-					if (rc)
-						goto err;
-				}
-				done = 1;
-				break;
-			}
-		}
-		if (!done && msum) {
-			if (n_gpfs >= MAXIFACE) {
-				ovis_log(mylog, OVIS_LERROR, "Cannot add %d-th gpfs %s. "
-					"Too many.\n", MAXIFACE+1, curriface);
-				rc = ENOMEM;
-				goto err;
-			}
-			/* add discovered interface if it's active. */
-			rc = add_gpfs(curriface);
-			if (rc)
-				goto err;
-			rc = update_gpfs(n_gpfs-1, msum, v);
-			if (rc)
-				goto err;
-		}
+        /* add discovered interface if it's active. */
+        rc = add_gpfs(curriface);
+        if (rc)
+            goto err;
+        rc = update_gpfs(n_gpfs-1, 0, v);
+        if (rc)
+            goto err;
+	
 	skip:
 		continue;
 	} while (s);
