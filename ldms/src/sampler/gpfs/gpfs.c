@@ -48,7 +48,7 @@
  */
 /**
  * \file gpfs.c
- * \brief /proc/net/dev data provider with set per device
+ * \brief GPFS Sampler
  */
 #include <inttypes.h>
 #include <unistd.h>
@@ -71,29 +71,22 @@
 
 static pthread_mutex_t cfg_lock = PTHREAD_MUTEX_INITIALIZER;
 
-#define PROC_FILE "/proc/net/dev"
-static char *procfile = PROC_FILE;
-#define NVARS 16
-static char *varname[] =
-{"rx_bytes", "rx_packets", "rx_errs", "rx_drop", "rx_fifo", "rx_frame",
-	"rx_compressed", "rx_multicast", "tx_bytes", "tx_packets", "tx_errs",
-	"tx_drop", "tx_fifo", "tx_colls", "tx_carrier", "tx_compressed"};
+#define GPFS_FILE "gpfs"
+static char *gpfs_file = GPFS_FILE;
+#define NVARS 15
+static char *varname[] = {"name","ip","node_name","timestamp", "cluster", "filesystem", "disks", "bytes_read", 
+							"bytes_written","opens", "closes", "reads", "writes", "read_dir", "inode_updates"};
 
-struct port {
+struct gpfs {
 	char name[20]; /* device name */
 	ldms_set_t set;
-	uint64_t last_sum; /* sum of integer metrics at last sampling. rollover in this sum is ok. */
 	int meta_done; /* have we set the device metric */
 	uint64_t update;
 };
-int niface = 0;
-//max number of interfaces we can include. TODO: alloc as added
 
-#define MAXIFACE 21
-static struct port ports[MAXIFACE];
-static int n_ports; /* number of ports in use */
-static char ignore_port[MAXIFACE][20];
-static size_t n_ignored; /* number of names ignored */
+#define MAXIFACE 10
+static struct gpfs gpfs[MAXIFACE];
+int n_gpfs;
 static int configured;
 static int termed;
 
@@ -114,24 +107,21 @@ static ldms_set_t get_set(struct ldmsd_sampler *self)
 	return NULL;
 }
 
-static void procnet_reset()
+static void gpfs_reset()
 {
 	if (mf)
 		fclose(mf);
 	mf = NULL;
 	int j;
-	for (j = 0; j < n_ports; j++) {
-		ldms_set_t set = ports[j].set;
+	for (j = 0; j < n_gpfs; j++) {
+		ldms_set_t set = gpfs[j].set;
 		if (set) {
                         const char *tmp = ldms_set_instance_name_get(set);
                         ldmsd_set_deregister(tmp, base->pi_name);
                         ldms_set_unpublish(set);
                         ldms_set_delete(set);
 		}
-		memset(&ports[j], 0, sizeof(ports[0]));
-	}
-	for (j = 0; j < MAXIFACE; j++) {
-		memset(ignore_port[j], 0, sizeof(ignore_port[0]));
+		memset(&gpfs[j], 0, sizeof(gpfs[0]));
 	}
 	if (base) {
 		free(base->instance_name);
@@ -140,14 +130,13 @@ static void procnet_reset()
 		base = NULL;
 	}
 	metric_offset = 0;
-	n_ignored = 0;
-	n_ports = 0;
+	n_gpfs = 0;
 	configured = 0;
 }
 
-static int add_port(const char *name)
+static int add_gpfs(const char *name)
 {
-	ovis_log(mylog, OVIS_LDEBUG, "adding port %s.\n", name);
+	ovis_log(mylog, OVIS_LDEBUG, "adding gpfs %s.\n", name);
 	/* temporarily override default instance name behavior */
 	char *tmp = base->instance_name;
 	size_t len = strlen(tmp);
@@ -169,12 +158,12 @@ static int add_port(const char *name)
 		goto err;
 	}
 	base_auth_set(&base->auth, set);
-	ports[n_ports].set = set;
-	strncpy(ports[n_ports].name, name, sizeof(ports[n_ports].name));
+	gpfs[n_gpfs].set = set;
+	strncpy(gpfs[n_gpfs].name, name, sizeof(gpfs[n_gpfs].name));
 	base->set = NULL;
 	free(base->instance_name);
 	base->instance_name = tmp;
-	n_ports++;
+	n_gpfs++;
 	rc = 0;
 err:
 	return rc;
@@ -186,11 +175,11 @@ static int create_metric_schema(base_data_t base)
 	ldms_schema_t schema;
 	int  j;
 
-	mf = fopen(procfile, "r");
+	mf = fopen(gpfs_file, "r");
 	if (!mf) {
 		ovis_log(mylog, OVIS_LERROR, "Could not open " SAMP " file "
 				"'%s'...exiting\n",
-				procfile);
+				gpfs_file);
 		return ENOENT;
 	}
 
@@ -204,10 +193,10 @@ static int create_metric_schema(base_data_t base)
 		goto err;
 	}
 
-	/* Location of first metric from proc file */
+	/* Location of first metric from gpfs file */
 	metric_offset = ldms_schema_metric_count_get(schema);
 
-	rc = ldms_schema_metric_array_add(schema, "device", LDMS_V_CHAR_ARRAY, sizeof(ports[0].name));
+	rc = ldms_schema_metric_array_add(schema, "gpfs", LDMS_V_CHAR_ARRAY, sizeof(gpfs[0].name));
 	if (rc < 0) {
 		ovis_log(mylog, OVIS_LERROR, "out of memory: device\n");
 		rc = ENOMEM;
@@ -288,7 +277,7 @@ static int config(struct ldmsd_plugin *self, struct attr_value_list *kwl, struct
 		goto err1;
 	}
 	if (configured) {
-		procnet_reset();
+		gpfs_reset();
 		ovis_log(mylog, OVIS_LDEBUG, "reconfiguring.\n");
 	}
 	n_ignored = 0;
@@ -338,27 +327,27 @@ err1:
 	return rc;
 }
 
-static int update_port(int j, uint64_t msum, union ldms_value *v)
+static int update_gpfs(int j, uint64_t msum, union ldms_value *v)
 {
-	ldms_set_t set = ports[j].set;
+	ldms_set_t set = gpfs[j].set;
 	if (!set || j < 0 || j >= MAXIFACE)
 		return EINVAL;
 	base->set = set;
 	int metric_no = metric_offset;
 	base_sample_begin(base);
-	if (!ports[j].meta_done) {
+	if (!gpfs[j].meta_done) {
 		ldms_metric_array_set_str( set, metric_no,
-			ports[j].name);
-		ports[j].meta_done = 1;
+			gpfs[j].name);
+		gpfs[j].meta_done = 1;
 	}
 	metric_no++;
-	ldms_metric_set_u64(set, metric_no, ports[j].update);
+	ldms_metric_set_u64(set, metric_no, gpfs[j].update);
 	metric_no++;
 	int i;
 	for (i = 0; i < NVARS; i++) {
 		ldms_metric_set(set, metric_no++, &v[i]);
 	}
-	ports[j].update++;
+	gpfs[j].update++;
 	base_sample_end(base);
 	base->set = NULL;
 	return 0;
@@ -382,18 +371,13 @@ static int sample(struct ldmsd_sampler *self)
 	}
 
 	if (!mf)
-		mf = fopen(procfile, "r");
+		mf = fopen(gpfs_file, "r");
 	if (!mf) {
-		ovis_log(mylog, OVIS_LERROR, "Could not open /proc/net/dev file "
-				"'%s'...exiting\n", procfile);
+		ovis_log(mylog, OVIS_LERROR, "Could not open /gpfs file "
+				"'%s'...exiting\n", gpfs_file);
 		rc = ENOENT;
 		goto err;
 	}
-
-	fseek(mf, 0, SEEK_SET); //seek should work if get to EOF
-	/* consume headers */
-	s = fgets(lbuf, sizeof(lbuf), mf);
-	s = fgets(lbuf, sizeof(lbuf), mf);
 
 	/* parse all data */
 	do {
@@ -410,20 +394,16 @@ static int sample(struct ldmsd_sampler *self)
 				" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
 				" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
 				" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
-				" %" PRIu64 "\n", curriface, &v[0].v_u64,
+				"\n", curriface, &v[0].v_u64,
 				&v[1].v_u64, &v[2].v_u64, &v[3].v_u64,
 				&v[4].v_u64, &v[5].v_u64, &v[6].v_u64,
 				&v[7].v_u64, &v[8].v_u64, &v[9].v_u64,
 				&v[10].v_u64, &v[11].v_u64, &v[12].v_u64,
-				&v[13].v_u64, &v[14].v_u64, &v[15].v_u64);
-		if (rc != 17) {
+				&v[13].v_u64, &v[14].v_u64);
+		if (rc != 15) {
 			ovis_log(mylog, OVIS_LINFO, "wrong number of "
 					"fields in sscanf. skipping line %s\n", lbuf);
 			continue;
-		}
-		for (j = 0; j < n_ignored; j++) {
-			if (!strcmp(curriface, ignore_port[j]))
-				goto skip;
 		}
 
 		uint64_t msum = 0;
@@ -433,10 +413,10 @@ static int sample(struct ldmsd_sampler *self)
 			msum += v[j].v_u64;
 
 		int done = 0;
-		for (j = 0; j < n_ports; j++) {
-			if (strcmp(curriface, ports[j].name) == 0) {
-				if (msum != ports[j].last_sum) {
-					rc = update_port(j, msum, v);
+		for (j = 0; j < n_gpfs; j++) {
+			if (strcmp(curriface, gpfs[j].name) == 0) {
+				if (msum != gpfs[j].last_sum) {
+					rc = update_gpfs(j, msum, v);
 					if (rc)
 						goto err;
 				}
@@ -445,17 +425,17 @@ static int sample(struct ldmsd_sampler *self)
 			}
 		}
 		if (!done && msum) {
-			if (n_ports >= MAXIFACE) {
-				ovis_log(mylog, OVIS_LERROR, "Cannot add %d-th port %s. "
-					"Too many ports.\n", MAXIFACE+1, curriface);
+			if (n_gpfs >= MAXIFACE) {
+				ovis_log(mylog, OVIS_LERROR, "Cannot add %d-th gpfs %s. "
+					"Too many.\n", MAXIFACE+1, curriface);
 				rc = ENOMEM;
 				goto err;
 			}
 			/* add discovered interface if it's active. */
-			rc = add_port(curriface);
+			rc = add_gpfs(curriface);
 			if (rc)
 				goto err;
-			rc = update_port(n_ports-1, msum, v);
+			rc = update_gpfs(n_gpfs-1, msum, v);
 			if (rc)
 				goto err;
 		}
@@ -473,14 +453,14 @@ static void term(struct ldmsd_plugin *self)
 {
 	(void)self;
 	pthread_mutex_lock(&cfg_lock);
-	procnet_reset();
+	gpfs_reset();
 	termed = 1;
 	pthread_mutex_unlock(&cfg_lock);
 	if (mylog)
 		ovis_log_destroy(mylog);
 }
 
-static struct ldmsd_sampler procnet_plugin = {
+static struct ldmsd_sampler gpfs_plugin = {
 	.base = {
 		.name = SAMP,
 		.type = LDMSD_PLUGIN_SAMPLER,
@@ -501,11 +481,11 @@ struct ldmsd_plugin *get_plugin()
 		ovis_log(NULL, OVIS_LWARN, "Failed to create the subsystem "
 				"of '" SAMP "' plugin. Error %d\n", rc);
 	}
-	return &procnet_plugin.base;
+	return &gpfs_plugin.base;
 }
 
-static void __attribute__ ((destructor)) procnet_plugin_fini(void);
-static void procnet_plugin_fini()
+static void __attribute__ ((destructor)) gpfs_plugin_fini(void);
+static void gpfs_plugin_fini()
 {
 	term(NULL);
 }
